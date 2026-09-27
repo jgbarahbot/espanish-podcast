@@ -13,7 +13,7 @@ if ! git diff --cached --quiet; then
   git -c user.name="jgbarahbot" -c user.email="jgbarahbot@users.noreply.github.com" commit -m "sync: $SKILL $(date -u +%F)"
   echo "committed local changes"
 fi
-URL="https://x-access-token:***}@github.com/${REPO}.git"
+URL="https://jgbarahbot:${TOK}@github.com/${REPO}.git"
 git fetch "$URL" main
 if ! git merge --ff-only FETCH_HEAD >/dev/null 2>&1; then
   echo "ERROR: cannot fast-forward; resolve diverged history manually" >&2
