@@ -103,3 +103,7 @@ ffprobe -v error -show_entries format=duration,bit_rate -of default=nw=1 <out.mp
 - Missing voice C falls back to A with a WARNING (the script never crashes on
   a missing optional voice); missing A is a hard ERROR.
 - The script text is passed to piper via stdin — never shell-interpolated.
+
+## Keeping this skill in sync with GitHub
+This directory is a git repo tracking `jgbarahbot/espanish-podcast`. After any local edit, run `./sync.sh` (commits, fast-forwards, and pushes using `GITHUB_CONTENT_RW_TOKEN` from `~/.hermes/.env`).
+
