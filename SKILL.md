@@ -13,7 +13,8 @@ requires:
 ## When to Use
 
 - A ready-made Spanish script exists and you need it as a spoken MP3.
-- The `iaahoy-daily-edition` pipeline calls this step for the daily podcast.
+- Any Spanish show/newsletter pipeline can call this as its audio step
+  (e.g. a daily newspaper that wants a spoken version of each edition).
 - NOT for: writing the script itself (the caller owns content), for English-only
   podcasts (voices are Spanish; only inline English terms get English IPA).
 
@@ -68,6 +69,24 @@ maps, and unknown phonemes are skipped silently — worst case a term degrades
 to plain Spanish, never a crash.
 
 If espeak is unavailable the script warns once and `*terms*` stay plain.
+
+### Pronunciation rules for English terms (do not "simplify" away)
+
+1. **Dictionary first.** `scripts/pron_dict.json` maps terms that do NOT get
+   English IPA (acronyms and names Spanish speakers say letter-by-letter or in
+   Spanish) to their Spanish pronunciation: `"llama.cpp" → "llama ce pe pe"`,
+   `"GGUF" → "ge guf"`, `"r/LocalLLaMA" → "erre LocalLlama"`. Lookup is
+   case-insensitive. New terms the user pronounces in Spanish go here.
+2. **Numbers inside a term are read in Spanish, digit by digit**: `Llama 3.45`
+   → "Llama **tres cuarenta y cinco**"; `Qwen-Image-2.1` → "Qwen Image **dos
+   punto uno**" (each decimal point is said "punto").
+3. **Otherwise** the term is phonemized with espeak en-US IPA as described
+   above.
+4. **Best-effort + report.** If a term sounds off, synthesize it anyway
+   (never block on pronunciation) but the script prints a
+   `UNSURE: <term>` list at the end (every term that went through the
+   espeak fallback); the caller should surface that list to the user so
+   uncertain terms can be added to `pron_dict.json`.
 
 ## Synthesis
 

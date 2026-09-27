@@ -13,14 +13,23 @@ A = davefx (es_ES-davefx-medium), C = Claude (es_MX-claude-high). The two
 voices alternate block by block; blocks without a marker default to A.
 
 ENGLISH TERMS: mark any English word/phrase with asterisks — `*notebook*`,
-`*Hugging Face*` — and it is pronounced in English. Before synthesis each
-`*term*` span is replaced by a `[[...]]` raw-phoneme block holding the term's
-English IPA (espeak-ng en-US via piper's bundled espeakbridge). Piper feeds
-`[[...]]` characters straight into the model's phoneme id-map (voice.py:
-`phonemes[-1].extend(text_part[2:-2].strip())`); every English IPA codepoint
-used by espeak en-US exists in both Spanish models' maps, and unknown
-phonemes are skipped silently (phoneme_ids.py), so worst case a term degrades
-to plain Spanish — it never crashes.
+`*Hugging Face*` — and it is pronounced in English. Resolution order before
+synthesis: (1) scripts/pron_dict.json (case-insensitive) — terms Spanish
+speakers say in Spanish, e.g. "llama.cpp" -> "llama ce pe pe", "GGUF" ->
+"ge guf", "r/LocalLLaMA" -> "erre LocalLlama"; (2) numbers inside a term are
+read in Spanish digit by digit and each dot is said "punto" ("Llama 3.45" ->
+"Llama tres cuarenta y cinco", "Qwen-Image-2.1" -> "Qwen Image dos punto
+uno"), then espeak en-US IPA; (3) otherwise the whole term goes to a `[[...]]`
+raw-phoneme block holding its English IPA (espeak-ng en-US via piper's bundled
+espeakbridge). Piper feeds `[[...]]` characters straight into the model's
+phoneme id-map (voice.py: `phonemes[-1].extend(text_part[2:-2].strip())`);
+every English IPA codepoint used by espeak en-US exists in both Spanish
+models' maps, and unknown phonemes are skipped silently (phoneme_ids.py), so
+worst case a term degrades to plain Spanish — it never crashes.
+
+EVERY term resolved via the espeak fallback is reported at the end as
+`UNSURE: <term>` so the caller can offer the user a list to grow
+pron_dict.json. Best effort: a bad-sounding term is still synthesized.
 
 Pipeline: each block --(piper, the block's voice)--> wav, blocks concatenated
 (380ms silence between) --(ffmpeg, libmp3lame)--> mp3.
@@ -29,6 +38,7 @@ Usage:
     python make_podcast.py --script script.txt --out podcast.mp3
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -43,6 +53,25 @@ VOICE_C = os.path.join(VOICE_DIR, "es_MX-claude-high.onnx")     # Claude
 FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 GAP_S = 0.38  # pause between blocks
 SPEAKERS = ("A", "C")
+PRON_DICT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "pron_dict.json")
+
+# Spanish reading of digits inside English terms: "3.45" -> "tres cuarenta y
+# cinco" (digit by digit), every dot -> "punto".
+ES_DIGIT = {str(d): w for d, w in enumerate(
+    ["cero", "uno", "dos", "tres", "cuatro", "cinco",
+     "seis", "siete", "ocho", "nueve"])}
+
+
+def load_pron_dict(path):
+    """Load the Spanish-pronunciation dictionary (case-insensitive keys)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return {str(k).lower(): str(v) for k, v in d.items()}
+    except Exception as e:  # missing/invalid dict must never break a podcast
+        print("WARNING: pronunciation dictionary unavailable (%s); using espeak only" % e)
+        return {}
 
 
 def _init_espeak_en():
@@ -87,13 +116,50 @@ def eng_ipa(term):
     return _IPA_CACHE[term]
 
 
-def mark_english(text):
-    """Replace `*English term*` spans with [[...]] raw-phoneme blocks."""
+def _spanish_digits(num):
+    """Read a number in Spanish, digit by digit; each dot is said "punto".
+
+    "3.45" -> "tres punto cuarenta y cinco"; "2.1" -> "dos punto uno".
+    """
+    parts = []
+    for ch in num:
+        if ch == ".":
+            parts.append("punto")
+        elif ch in ES_DIGIT:
+            parts.append(ES_DIGIT[ch])
+    return " ".join(parts)
+
+
+def mark_english(text, pron_dict=None, unsure=None):
+    """Replace `*English term*` spans per the pronunciation rules:
+    dict (Spanish) -> numbers in Spanish + espeak en-US IPA per word chunk.
+    Only the alphabetic chunks go through espeak; digit chunks and the word
+    "punto" stay as plain Spanish text so Piper says them in Spanish.
+    Any term that used the espeak fallback is added to `unsure` (order kept)."""
+    if pron_dict is None:
+        pron_dict = {}
+
     def sub(m):
         term = m.group(1).strip()
-        ipa = eng_ipa(term)
-        return "[[%s]]" % ipa if ipa else term
-    return re.sub(r"\*([^*\n]+)\*", sub, text)
+        low = term.lower()
+        if low in pron_dict:
+            return pron_dict[low]
+        out, used_fallback = [], False
+        for part in re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d[\d.,/]*", term):
+            if part[0].isdigit():
+                out.append(_spanish_digits(part))
+            else:
+                ipa = eng_ipa(part)
+                if ipa:
+                    used_fallback = True
+                    out.append("[[%s]]" % ipa)
+                else:
+                    out.append(part)  # no espeak: best-effort plain text
+        if used_fallback and unsure is not None and term not in unsure:
+            unsure.append(term)
+        return " ".join(out) if out else term
+
+    return re.sub(r"\*([^\*\n]+)\*", sub, text)
 
 
 def parse_blocks(path):
@@ -169,9 +235,11 @@ def main():
 
     tmp = os.path.abspath(args.out + ".build")
     os.makedirs(tmp, exist_ok=True)
+    pron_dict = load_pron_dict(PRON_DICT)
+    unsure = []
     wavs = []
     for i, (voice, text) in enumerate(blocks, 1):
-        wavs.append(synth(tmp, voices[voice], i, mark_english(text)))
+        wavs.append(synth(tmp, voices[voice], i, mark_english(text, pron_dict, unsure)))
 
     listfile = os.path.join(tmp, "concat.txt")
     with open(listfile, "w", encoding="utf-8") as f:
@@ -203,6 +271,13 @@ def main():
     size = os.path.getsize(args.out)
     print("OK podcast %s (%d bytes, %d blocks, %d A / %d C)"
           % (args.out, size, len(blocks), counts["A"], counts["C"]))
+    if unsure:
+        print("Terms pronounced via espeak fallback — review, and add the ones "
+              "you say in Spanish to scripts/pron_dict.json:")
+        for term in unsure:
+            print("UNSURE: %s" % term)
+    else:
+        print("All English terms resolved via the pronunciation dictionary.")
 
 
 if __name__ == "__main__":
