@@ -1,41 +1,47 @@
 #!/usr/bin/env python3
-"""Two-voice Spanish podcast — Spanish script -> MP3 via local Piper TTS.
+"""Two-voice Spanish podcast — Spanish script -> MP3.
 
-Part of the `espanish-podcast` skill. See that SKILL.md for the script
-format, English-term marking (*term* -> English IPA) and pitfalls.
+Default engine: CosyVoice2-0.5B (Apache-2.0) on CPU — emotion/intonation
+control via Spanish instructions + voice cloning from short reference clips.
+Fallback engine: local Piper (fast, no emotion) via `--engine piper`.
+
+Part of the `espanish-podcast` skill. See that SKILL.md for the full
+script format and pitfalls.
 
 Script format: paragraphs prefixed with the speaker letter on the same line:
 
     A: Bienvenidos...
     C: Empecemos por la portada...
 
-A = davefx (es_ES-davefx-medium), C = Claude (es_MX-claude-high). The two
-voices alternate block by block; blocks without a marker default to A.
+A and C are cloned from reference clips (refA.wav / refC.wav, 5-10 s each,
+generated from the Piper voices when absent). Blocks without a marker
+default to A.
+
+EMOTION: tag a block with one of the supported tones right after the
+speaker marker (or on its own line in the block):
+
+    A [alegre]: Hoy repasamos...
+    A [solemne]: Y para cerrar...
+
+Supported: alegre, animado, solemne, serio, calmo, sorpresa, curiosidad,
+urgencia, cierre. No tag -> neutral reading. Tones are expressed in Spanish
+via CosyVoice2 `instruct2`; the same reference clip keeps the voice
+identity, only the delivery changes.
 
 ENGLISH TERMS: mark any English word/phrase with asterisks — `*notebook*`,
-`*Hugging Face*` — and it is pronounced in English. Resolution order before
-synthesis: (1) scripts/pron_dict.json (case-insensitive) — terms Spanish
-speakers say in Spanish, e.g. "llama.cpp" -> "llama ce pe pe", "GGUF" ->
-"ge guf", "r/LocalLLaMA" -> "erre LocalLlama"; (2) numbers inside a term are
-read in Spanish digit by digit and each dot is said "punto" ("Llama 3.45" ->
-"Llama tres cuarenta y cinco", "Qwen-Image-2.1" -> "Qwen Image dos punto
-uno"), then espeak en-US IPA; (3) otherwise the whole term goes to a `[[...]]`
-raw-phoneme block holding its English IPA (espeak-ng en-US via piper's bundled
-espeakbridge). Piper feeds `[[...]]` characters straight into the model's
-phoneme id-map (voice.py: `phonemes[-1].extend(text_part[2:-2].strip())`);
-every English IPA codepoint used by espeak en-US exists in both Spanish
-models' maps, and unknown phonemes are skipped silently (phoneme_ids.py), so
-worst case a term degrades to plain Spanish — it never crashes.
+`*Hugging Face*` — and it is read in English. Resolution order: (1)
+scripts/pron_dict.json (case-insensitive) — terms Spanish speakers say in
+Spanish; (2) otherwise the asterisks are stripped and the term stays as
+plain text for the engine (CosyVoice2 is multilingual and reads English
+terms in English; Piper gets the raw term as best effort — grow
+pron_dict.json for exact Spanish readings).
 
-EVERY term resolved via the espeak fallback is reported at the end as
-`UNSURE: <term>` so the caller can offer the user a list to grow
-pron_dict.json. Best effort: a bad-sounding term is still synthesized.
-
-Pipeline: each block --(piper, the block's voice)--> wav, blocks concatenated
-(380ms silence between) --(ffmpeg, libmp3lame)--> mp3.
+Pipeline: each block --(engine, the block's voice)--> wav, blocks
+concatenated (380 ms silence between) --(ffmpeg, libmp3lame)--> mp3.
 
 Usage:
     python make_podcast.py --script script.txt --out podcast.mp3
+    python make_podcast.py --script s.txt --out p.mp3 --engine piper
 """
 import argparse
 import json
@@ -44,10 +50,11 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
-VENV = os.path.expanduser("~/.hermes/hermes-agent/venv")
-PIPER = os.path.join(VENV, "bin", "piper")
-VOICE_DIR = os.path.expanduser("~/.hermes/cache/piper-voices")
+HOME = os.path.expanduser("~")
+PIPER = os.path.join(HOME, ".hermes", "hermes-agent", "venv", "bin", "piper")
+VOICE_DIR = os.path.join(HOME, ".hermes", "cache", "piper-voices")
 VOICE_A = os.path.join(VOICE_DIR, "es_ES-davefx-medium.onnx")   # davefx
 VOICE_C = os.path.join(VOICE_DIR, "es_MX-claude-high.onnx")     # Claude
 FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
@@ -56,11 +63,21 @@ SPEAKERS = ("A", "C")
 PRON_DICT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "pron_dict.json")
 
-# Spanish reading of digits inside English terms: "3.45" -> "tres cuarenta y
-# cinco" (digit by digit), every dot -> "punto".
-ES_DIGIT = {str(d): w for d, w in enumerate(
-    ["cero", "uno", "dos", "tres", "cuatro", "cinco",
-     "seis", "siete", "ocho", "nueve"])}
+# CosyVoice (CPU, emotion) — worker + persistent env/model
+CV_PY = os.environ.get("COSYVOICE_PYTHON",
+                       os.path.join(HOME, ".hermes", "venvs",
+                                    "cosyvoice", "bin", "python"))
+CV_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "cosyvoice_worker.py")
+CV_REF_DIR = os.path.join(HOME, ".hermes", "cache", "cosyvoice")
+CV_SR = 24000
+
+# Piper reference clip (seconds) used to seed the CosyVoice clone refs.
+REF_SEED_TEXTS = {
+    "A": "Bienvenidos a iaahoy, el diario de la inteligencia artificial. Hoy repasamos las noticias del mundo de los modelos de lenguaje.",
+    "C": "Empecemos por la portada. Repasemos las noticias de hoy sobre los modelos de lenguaje abiertos y su avance.",
+}
+REF_TARGET_S = 6.5
 
 
 def load_pron_dict(path):
@@ -70,101 +87,135 @@ def load_pron_dict(path):
             d = json.load(f)
         return {str(k).lower(): str(v) for k, v in d.items()}
     except Exception as e:  # missing/invalid dict must never break a podcast
-        print("WARNING: pronunciation dictionary unavailable (%s); using espeak only" % e)
+        print("WARNING: pronunciation dictionary unavailable (%s); "
+              "terms stay as plain text" % e)
         return {}
 
 
-def _init_espeak_en():
-    """Init piper's bundled espeak-ng with the en-US voice, for English IPA.
-
-    piper's EspeakPhonemizer is used only to initialize the espeakbridge
-    library (it strips (lang) flags, so it cannot itself produce English
-    phonemes); we then call espeakbridge directly with the en-US voice.
-    """
-    sp = os.path.join(VENV, "lib",
-                      "python%d.%d" % sys.version_info[:2], "site-packages")
-    if sp not in sys.path:
-        sys.path.insert(0, sp)
-    from piper.phonemize_espeak import EspeakPhonemizer
-    from piper import espeakbridge
-    EspeakPhonemizer()               # initializes the espeak-ng bridge
-    espeakbridge.set_voice("en-us")  # English dictionary + voice rules
-    return espeakbridge
-
-
-_ESPEAK_EN = None
-_IPA_CACHE = {}
-
-
-def eng_ipa(term):
-    """English IPA for `term` (espeak en-US), cached. None on any failure."""
-    global _ESPEAK_EN
-    if _ESPEAK_EN is None:
-        try:
-            _ESPEAK_EN = _init_espeak_en()
-        except Exception as e:  # pragma: no cover
-            print("WARNING: espeak EN unavailable (%s); *terms* stay plain" % e)
-            _ESPEAK_EN = False
-    if not _ESPEAK_EN:
-        return None
-    if term not in _IPA_CACHE:
-        try:
-            ipa = "".join(p for p, _, _ in _ESPEAK_EN.get_phonemes(term))
-            _IPA_CACHE[term] = ipa if ipa.strip() else None
-        except Exception:
-            _IPA_CACHE[term] = None
-    return _IPA_CACHE[term]
-
-
-def _spanish_digits(num):
-    """Read a number in Spanish, digit by digit; each dot is said "punto".
-
-    "3.45" -> "tres punto cuarenta y cinco"; "2.1" -> "dos punto uno".
-    """
-    parts = []
-    for ch in num:
-        if ch == ".":
-            parts.append("punto")
-        elif ch in ES_DIGIT:
-            parts.append(ES_DIGIT[ch])
-    return " ".join(parts)
-
-
-def mark_english(text, pron_dict=None, unsure=None):
-    """Replace `*English term*` spans per the pronunciation rules:
-    dict (Spanish) -> numbers in Spanish + espeak en-US IPA per word chunk.
-    Only the alphabetic chunks go through espeak; digit chunks and the word
-    "punto" stay as plain Spanish text so Piper says them in Spanish.
-    Any term that used the espeak fallback is added to `unsure` (order kept)."""
+def mark_english(text, pron_dict=None):
+    """Resolve `*English term*` spans: pron_dict (Spanish) first, else strip
+    the asterisks and let the engine read the term in English."""
     if pron_dict is None:
         pron_dict = {}
 
     def sub(m):
         term = m.group(1).strip()
-        low = term.lower()
-        if low in pron_dict:
-            return pron_dict[low]
-        out, used_fallback = [], False
-        for part in re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d[\d.,/]*", term):
-            if part[0].isdigit():
-                out.append(_spanish_digits(part))
-            else:
-                ipa = eng_ipa(part)
-                if ipa:
-                    used_fallback = True
-                    out.append("[[%s]]" % ipa)
-                else:
-                    out.append(part)  # no espeak: best-effort plain text
-        if used_fallback and unsure is not None and term not in unsure:
-            unsure.append(term)
-        return " ".join(out) if out else term
+        return pron_dict.get(term.lower(), term)
 
     return re.sub(r"\*([^\*\n]+)\*", sub, text)
 
 
+# ---------------------------------------------------------------------------
+# Numbers in Spanish (standing rule: every figure is spoken in Spanish, not
+# spelled out in the target language).
+# ---------------------------------------------------------------------------
+_ES_DIGIT = {0: "cero", 1: "uno", 2: "dos", 3: "tres", 4: "cuatro",
+             5: "cinco", 6: "seis", 7: "siete", 8: "ocho", 9: "nueve",
+             10: "diez", 11: "once", 12: "doce", 13: "trece", 14: "catorce",
+             15: "quince", 16: "dieciséis", 17: "diecisiete", 18: "dieciocho",
+             19: "diecinueve", 20: "veinte", 21: "veintiuno", 22: "veintidós",
+             23: "veintitrés", 24: "veinticuatro", 25: "veinticinco",
+             26: "veintiséis", 27: "veintisiete", 28: "veintiocho",
+             29: "veintinueve", 30: "treinta", 40: "cuarenta", 50: "cincuenta",
+             60: "sesenta", 70: "setenta", 80: "ochenta", 90: "noventa",
+             100: "cien"}
+_ES_TEN_Y = {3: "treinta y ", 4: "cuarenta y ", 5: "cincuenta y ",
+             6: "sesenta y ", 7: "setenta y ", 8: "ochenta y ", 9: "noventa y "}
+_ES_HUND = {1: "", 2: "doscientos", 3: "trescientos", 4: "cuatrocientos",
+            5: "quinientos", 6: "seiscientos", 7: "setecientos",
+            8: "ochocientos", 9: "novecientos"}
+
+
+def _es_below_100(n):
+    if n <= 30:
+        return _ES_DIGIT[n]
+    t, u = divmod(n, 10)
+    if u == 0:
+        return _ES_DIGIT[t * 10]
+    return _ES_TEN_Y[t] + _ES_DIGIT[u]
+
+
+def _es_below_1000(n):
+    h, r = divmod(n, 100)
+    if h == 0:
+        return _es_below_100(n)
+    base = _ES_HUND[h]
+    if r == 0:
+        return (base + " cien") if h == 1 else base
+    return base + " " + _es_below_100(r)
+
+
+def _es_below_10000(n):
+    th, r = divmod(n, 1000)
+    if th == 0:
+        return _es_below_1000(n)
+    base = "mil" if th == 1 else _es_below_1000(th) + " mil"
+    if r == 0:
+        return base
+    return base + " " + _es_below_1000(r)
+
+
+def _es_number(n):
+    if n < 0:
+        return "menos " + _es_number(-n)
+    if n < 10000:
+        return _es_below_10000(n)
+    if n < 1000000:
+        t, r = divmod(n, 1000)
+        base = "mil" if t == 1 else _es_below_1000(t) + " mil"
+        return base if r == 0 else base + " " + _es_below_1000(r)
+    if n < 1000000000:
+        m, r = divmod(n, 1000000)
+        base = ("un millón" if m == 1 else _es_below_1000(m) + " millones")
+        return base if r == 0 else base + " " + _es_below_100000(r)
+    return str(n)
+
+
+_NUM_DEC_RE = re.compile(r"(?<![\w.\-])(\d{1,4})[.,](\d{1,4})(?![\w.])")
+_NUM_PCT_RE = re.compile(r"(?<![\w.\-])(\d{1,7}(?:[.,]\d{1,4})?)\s*%")
+_NUM_INT_RE = re.compile(r"(?<![\w.\-])(\d{1,9})(?![\w.])")
+
+
+def _int_spanish(digits):
+    if not digits.isdigit():
+        return digits
+    n = int(digits)
+    return _es_number(n) if n < 1000000000 else digits
+
+
+def spanish_digits(text):
+    """Speak every figure in Spanish: 2026 -> dos mil veintiséis,
+    3.0 -> tres punto cero, 45% -> cuarenta y cinco por ciento.
+    Digits glued to letters (v2, llama-3.1) are left alone."""
+    def pct(m):
+        s = m.group(1)
+        if "," in s:
+            whole, frac = s.split(",", 1)
+            f = " ".join(_ES_DIGIT[int(c)] for c in frac)
+            return _int_spanish(whole) + " punto " + f + " por ciento"
+        return _int_spanish(s) + " por ciento"
+
+    def dec(m):
+        w = int(m.group(1))
+        f = " ".join(_ES_DIGIT[int(c)] for c in m.group(2))
+        return _int_spanish(m.group(1)) + " punto " + f
+    text = _NUM_PCT_RE.sub(pct, text)
+    text = _NUM_DEC_RE.sub(dec, text)
+    text = _NUM_INT_RE.sub(lambda m: _int_spanish(m.group(1)), text)
+    return text
+
+
+_EMOTION_RE = re.compile(r"\[([A-Za-záéíóúñ]+)\]")
+EMOTIONS = ("alegre", "animado", "solemne", "serio", "calmo",
+            "sorpresa", "curiosidad", "urgencia", "cierre")
+
+
 def parse_blocks(path):
-    """Split the script into (voice, text) blocks. Voice is 'A' or 'C';
-    blocks without a marker default to 'A'."""
+    """Split the script into (voice, emotion, text) blocks.
+
+    Voice is 'A' or 'C' (default 'A'); emotion is one of EMOTIONS given as
+    a [tag] right after the speaker marker or anywhere in the block (first
+    tag wins and is removed from the text)."""
     with open(path, encoding="utf-8") as f:
         raw = f.read()
     blocks = []
@@ -172,112 +223,282 @@ def parse_blocks(path):
         lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
         if not lines:
             continue
-        voice = "A"
-        m = re.match(r"^([AC])\s*:\s*(.*)", lines[0])
+        voice, text = "A", ""
+        m = re.match(r"^([AC])\s*:(.*)", lines[0])
         if m:
             voice = m.group(1)
-            rest = m.group(2).strip()
-            lines = [rest] + lines[1:]
-        text = " ".join(lines).strip()
+            lines = [m.group(2).strip()] + lines[1:]
+        text = " ".join(ln for ln in lines if ln).strip()
+        if not text:
+            continue
+        emotion = None
+        for ln in lines:
+            mt = _EMOTION_RE.search(ln)
+            if mt and mt.group(1).lower() in EMOTIONS:
+                emotion = mt.group(1).lower()
+                break
+        text = _EMOTION_RE.sub("", text)
+        text = re.sub(r"\s{2,}", " ", text).strip()
         if text:
-            blocks.append((voice, text))
+            blocks.append((voice, emotion, text))
     return blocks
 
 
-def synth(out_dir, voice, idx, text):
+def _ffmpeg(args):
+    r = subprocess.run([FFMPEG] + args, capture_output=True)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr.decode("utf-8", "replace")[-1500:])
+    return r.returncode == 0
+
+
+def synth_piper(out_dir, voice_onnx, idx, text):
     out = os.path.join(out_dir, "blk_%02d.wav" % idx)
-    r = subprocess.run([PIPER, "-m", voice, "-f", out],
+    r = subprocess.run([PIPER, "-m", voice_onnx, "-f", out],
                        input=text.encode("utf-8"), capture_output=True)
     if r.returncode != 0 or not os.path.exists(out):
-        print("PIPER FAILED (%s, block %d):\n%s" % (voice, idx, r.stderr.decode("utf-8", "replace")))
+        print("PIPER FAILED (block %d):\n%s" % (idx, r.stderr.decode("utf-8", "replace")))
         sys.exit(1)
-    # Some voices emit 16 kHz (e.g. es_ES-mls_9972-low); the concat target is
-    # 22050 Hz, so resample every block to the same rate to avoid pitch/speed
-    # shifts on the final MP3.
     norm = os.path.join(out_dir, "blk_%02d_norm.wav" % idx)
-    r = subprocess.run([FFMPEG, "-y", "-i", out, "-ar", "22050", "-ac", "1",
-                        "-acodec", "pcm_s16le", norm], capture_output=True)
-    if r.returncode != 0:
-        print("FFMPEG RESAMPLE FAILED (block %d):\n%s" % (idx, r.stderr.decode("utf-8", "replace")))
+    if not _ffmpeg(["-y", "-i", out, "-ar", "22050", "-ac", "1",
+                    "-acodec", "pcm_s16le", norm]):
+        print("FFMPEG RESAMPLE FAILED (block %d)" % idx)
         sys.exit(1)
     os.remove(out)
     return norm
+
+
+def ensure_ref_clips(ref_dir, voice_a, voice_c):
+    """Seed refA.wav / refC.wav (5-10 s) from the Piper voices when absent."""
+    os.makedirs(ref_dir, exist_ok=True)
+    for spk, onnx in (("A", voice_a), ("C", voice_c)):
+        ref = os.path.join(ref_dir, "ref%s.wav" % spk)
+        if os.path.exists(ref):
+            return ref
+        raw = os.path.join(ref_dir, "seed_%s.wav" % spk)
+        r = subprocess.run([PIPER, "-m", onnx, "-f", raw],
+                           input=REF_SEED_TEXTS[spk].encode("utf-8"),
+                           capture_output=True)
+        if r.returncode != 0 or not os.path.exists(raw):
+            print("ERROR: cannot seed CosyVoice reference clip %s (piper failed)" % ref)
+            sys.exit(1)
+        _ffmpeg(["-y", "-i", raw, "-t", str(REF_TARGET_S),
+                 "-ar", str(CV_SR), "-ac", "1", "-acodec", "pcm_s16le", ref])
+        os.remove(raw)
+        if not os.path.exists(ref):
+            print("ERROR: failed to create reference clip %s" % ref)
+            sys.exit(1)
+        print("reference clip %s created (%.1f s)" % (ref, REF_TARGET_S))
+
+
+class CosyWorker:
+    """Long-lived CosyVoice2 worker subprocess (JSON over stdin/stdout).
+
+    Loads the model once, then synthesizes one block per job line. The
+    worker resamples its own references and writes 24 kHz mono WAVs.
+    """
+
+    def __init__(self, worker_py, worker, ref_dir):
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="",
+                   OMP_NUM_THREADS="4", COSYVOICE_REFS=ref_dir)
+        self.proc = subprocess.Popen([worker_py, worker],
+                                     stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL,
+                                     env=env, text=True, bufsize=1)
+        deadline = time.time() + 420
+        while time.time() < deadline:
+            line = self.proc.stdout.readline()
+            if not line:
+                break
+            msg = json.loads(line)
+            if msg.get("ready"):
+                self.sr = msg.get("sr", CV_SR)
+                return
+            if "warmup_error" in msg:
+                print("WARNING: CosyVoice warmup: %s" % msg["warmup_error"])
+        raise SystemExit("ERROR: CosyVoice worker did not become ready (load timeout)")
+
+    def synth(self, out, spk, text, emotion):
+        job = {"spk": spk, "text": text, "emotion": emotion, "out": out}
+        self.proc.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise SystemExit("ERROR: CosyVoice worker died (pid=%s)" % self.proc.pid)
+            msg = json.loads(line)
+            if msg.get("ok"):
+                return msg["ok"]
+            if "error" in msg:
+                raise SystemExit("ERROR: CosyVoice synthesis failed: %s" % msg["error"])
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=30)
+        except Exception:
+            self.proc.kill()
+
+
+def synth_cosyworker(worker, out_dir, idx, spk, text, emotion):
+    out = os.path.join(out_dir, "blk_%02d.wav" % idx)
+    if os.path.exists(out) and os.path.getsize(out) > 1000:
+        print("  block %02d already done, skipping" % idx)
+        return out
+    return worker.synth(out, spk, text, emotion)
+
+
+def assemble(wavs, gap_s, sr, out_mp3):
+    tmp = os.path.abspath(out_mp3 + ".build")
+    os.makedirs(tmp, exist_ok=True)
+    gap = os.path.join(tmp, "gap.wav")
+    if not _ffmpeg(["-y", "-f", "lavfi", "-i", "anullsrc=r=%d:cl=mono" % sr,
+                    "-t", str(gap_s), "-acodec", "pcm_s16le", gap]):
+        print("FFMPEG GAP FAILED")
+        sys.exit(1)
+    listfile = os.path.join(tmp, "concat.txt")
+    with open(listfile, "w", encoding="utf-8") as f:
+        f.write("file '%s'\n" % gap)
+        for w in wavs:
+            f.write("file '%s'\n" % w)
+    joined = os.path.join(tmp, "joined.wav")
+    if not _ffmpeg(["-y", "-f", "concat", "-safe", "0", "-i", listfile,
+                    "-acodec", "pcm_s16le", joined]):
+        print("FFMPEG CONCAT FAILED")
+        sys.exit(1)
+    if not _ffmpeg(["-y", "-i", joined, "-codec:a", "libmp3lame",
+                    "-qscale:a", "3", "-ar", str(sr), "-ac", "1", out_mp3]):
+        print("FFMPEG ENCODE FAILED")
+        sys.exit(1)
+    shutil.rmtree(tmp, ignore_errors=True)
+    if not os.path.exists(out_mp3):
+        print("FFMPEG ENCODE FAILED (no output)")
+        sys.exit(1)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--script", required=True, help="path to two-voice Spanish script")
     ap.add_argument("--out", required=True, help="output MP3 path")
-    ap.add_argument("--voice-a", default=VOICE_A, help="davefx voice model")
-    ap.add_argument("--voice-c", default=VOICE_C, help="Claude voice model")
+    ap.add_argument("--engine", choices=("cosy", "piper"), default="cosy",
+                    help="TTS engine: cosy=cosyvoice (emotion, CPU, slower), "
+                         "piper=local piper (fast, no emotion)")
+    ap.add_argument("--voice-a", default=VOICE_A, help="davefx voice model (piper/seed)")
+    ap.add_argument("--voice-c", default=VOICE_C, help="Claude voice model (piper/seed)")
+    ap.add_argument("--only", nargs=2, type=int, metavar=("START", "END"),
+                    help="synth only blocks START..END (1-based) into the build dir, "
+                         "no assembly. Lets long podcasts run in chunks that fit a "
+                         "single supervised process window; run --assemble once every "
+                         "block's WAV exists.")
+    ap.add_argument("--assemble", action="store_true",
+                    help="only assemble the MP3 from the WAVs already in the build "
+                         "dir (no synthesis, no worker)")
+    ap.add_argument("--clean", action="store_true",
+                    help="delete the build dir before starting (fresh run)")
     args = ap.parse_args()
-
-    if not os.path.exists(PIPER):
-        print("ERROR: piper not found at", PIPER)
-        sys.exit(1)
-    voices = {}
-    for sp in SPEAKERS:
-        path = getattr(args, "voice_%s" % sp.lower())
-        if not os.path.exists(path):
-            print("WARNING: voice %s missing (%s), falling back to A" % (sp, path))
-            path = args.voice_a
-        voices[sp] = path
-    if not os.path.exists(args.voice_a):
-        print("ERROR: voice A not found:", args.voice_a)
-        sys.exit(1)
 
     blocks = parse_blocks(args.script)
     if not blocks:
         print("ERROR: empty script")
         sys.exit(1)
-    counts = {sp: sum(1 for v, _ in blocks if v == sp) for sp in SPEAKERS}
-    print("script: %d blocks (%d A, %d C)" % (len(blocks), counts["A"], counts["C"]))
+    counts = {sp: sum(1 for v, _, _ in blocks if v == sp) for sp in SPEAKERS}
+    n_emo = sum(1 for _, e, _ in blocks if e)
+    n = len(blocks)
+    print("script: %d blocks (%d A, %d C, %d with emotion)"
+          % (n, counts["A"], counts["C"], n_emo))
 
+    if args.only and not (1 <= args.only[0] <= args.only[1] <= n):
+        print("ERROR: --only %d %d out of range (1..%d)" % (args.only[0], args.only[1], n))
+        sys.exit(1)
+
+    sr = CV_SR if args.engine == "cosy" else 22050
     tmp = os.path.abspath(args.out + ".build")
+    if args.clean:
+        shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp, exist_ok=True)
+
+    # --assemble: build the MP3 from the WAVs already on disk (no worker)
+    if args.assemble:
+        wavs = [os.path.join(tmp, "blk_%02d.wav" % i) for i in range(1, n + 1)]
+        missing = [w for w in wavs if not os.path.exists(w)]
+        if missing:
+            print("ERROR: cannot assemble, missing %d of %d WAV(s); first missing: %s"
+                  % (len(missing), n, os.path.basename(missing[0])))
+            sys.exit(1)
+        t0 = time.time()
+        assemble(wavs, GAP_S, sr, args.out)
+        size = os.path.getsize(args.out)
+        print("OK podcast %s (%d bytes, %d blocks, %s, %.0fs assemble)"
+              % (args.out, size, n, args.engine, time.time() - t0))
+        return
+
     pron_dict = load_pron_dict(PRON_DICT)
-    unsure = []
-    wavs = []
-    for i, (voice, text) in enumerate(blocks, 1):
-        wavs.append(synth(tmp, voices[voice], i, mark_english(text, pron_dict, unsure)))
+    t0 = time.time()
+    do_assemble = not args.only
 
-    listfile = os.path.join(tmp, "concat.txt")
-    with open(listfile, "w", encoding="utf-8") as f:
-        f.write("file '%s'\n" % os.path.join(tmp, "gap.wav"))
-        for w in wavs:
-            f.write("file '%s'\n" % w)
-    subprocess.run([FFMPEG, "-y", "-f", "lavfi", "-i",
-                    "anullsrc=r=22050:cl=mono", "-t", str(GAP_S),
-                    "-acodec", "pcm_s16le", os.path.join(tmp, "gap.wav")],
-                   capture_output=True, check=True)
-
-    joined = os.path.join(tmp, "joined.wav")
-    r = subprocess.run([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", listfile,
-                        "-acodec", "pcm_s16le", joined],
-                       capture_output=True)
-    if r.returncode != 0:
-        print("FFMPEG CONCAT FAILED:\n" + r.stderr.decode("utf-8", "replace"))
-        sys.exit(1)
-
-    r = subprocess.run([FFMPEG, "-y", "-i", joined,
-                        "-codec:a", "libmp3lame", "-qscale:a", "3",
-                        "-ar", "22050", "-ac", "1", args.out],
-                       capture_output=True)
-    shutil.rmtree(tmp, ignore_errors=True)
-    if r.returncode != 0 or not os.path.exists(args.out):
-        print("FFMPEG FAILED:\n" + r.stderr.decode("utf-8", "replace"))
-        sys.exit(1)
-
-    size = os.path.getsize(args.out)
-    print("OK podcast %s (%d bytes, %d blocks, %d A / %d C)"
-          % (args.out, size, len(blocks), counts["A"], counts["C"]))
-    if unsure:
-        print("Terms pronounced via espeak fallback — review, and add the ones "
-              "you say in Spanish to scripts/pron_dict.json:")
-        for term in unsure:
-            print("UNSURE: %s" % term)
+    if args.engine == "cosy":
+        if not (os.path.exists(CV_PY) and os.path.exists(CV_WORKER)):
+            print("ERROR: cosyvoice unavailable (python: %s, worker: %s); "
+                  "retry with --engine piper" % (CV_PY, CV_WORKER))
+            sys.exit(1)
+        ensure_ref_clips(CV_REF_DIR, args.voice_a, args.voice_c)
+        worker = CosyWorker(CV_PY, CV_WORKER, CV_REF_DIR)
+        sr = worker.sr
+        print("cosyvoice ready (sr=%d)" % sr)
+        wavs = []
+        try:
+            for i, (voice, emotion, text) in enumerate(blocks, 1):
+                if args.only and not (args.only[0] <= i <= args.only[1]):
+                    continue
+                t = time.time()
+                wavs.append(synth_cosyworker(worker, tmp, i, voice,
+                                             spanish_digits(mark_english(text, pron_dict)), emotion))
+                print("block %02d %s%s %6.1fs" %
+                      (i, voice, " [%s]" % emotion if emotion else "", time.time() - t))
+        finally:
+            worker.close()
+        if do_assemble:
+            assemble(wavs, GAP_S, sr, args.out)
+            shutil.rmtree(tmp, ignore_errors=True)
+            size = os.path.getsize(args.out)
+            print("OK podcast %s (%d bytes, %d blocks, %d A / %d C, %d emotion, %s, %.0fs)"
+                  % (args.out, size, n, counts["A"], counts["C"],
+                     n_emo, args.engine, time.time() - t0))
+        else:
+            print("chunk done: blocks %d-%d synthesized into %s (%.0fs)"
+                  % (args.only[0], args.only[1], tmp, time.time() - t0))
+            print("NEXT: run --only <next range> for the remaining blocks, then "
+                  "--assemble once blocks 1-%d all exist" % n)
     else:
-        print("All English terms resolved via the pronunciation dictionary.")
+        # piper: fast enough that chunking is rarely needed, but it still works
+        if not os.path.exists(PIPER):
+            print("ERROR: piper not found at", PIPER)
+            sys.exit(1)
+        voices = {}
+        for sp in SPEAKERS:
+            path = getattr(args, "voice_%s" % sp.lower())
+            if not os.path.exists(path):
+                print("WARNING: voice %s missing (%s), falling back to A" % (sp, path))
+                path = args.voice_a
+            voices[sp] = path
+        if not os.path.exists(args.voice_a):
+            print("ERROR: voice A not found:", args.voice_a)
+            sys.exit(1)
+        wavs = []
+        for i, (voice, emotion, text) in enumerate(blocks, 1):
+            if args.only and not (args.only[0] <= i <= args.only[1]):
+                continue
+            wavs.append(synth_piper(tmp, voices[voice], i,
+                                    spanish_digits(mark_english(text, pron_dict))))
+        if do_assemble:
+            assemble(wavs, GAP_S, sr, args.out)
+            shutil.rmtree(tmp, ignore_errors=True)
+            size = os.path.getsize(args.out)
+            print("OK podcast %s (%d bytes, %d blocks, %s, %.0fs)"
+                  % (args.out, size, n, args.engine, time.time() - t0))
+        else:
+            print("chunk done (piper): blocks %d-%d into %s"
+                  % (args.only[0], args.only[1], tmp))
 
 
 if __name__ == "__main__":
