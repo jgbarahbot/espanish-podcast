@@ -141,7 +141,12 @@ def main():
             instr = resolve_instruct(emo)
             if instr is not None:
                 gen = cv.inference_instruct2(tts_text=text,
-                                             instruct_text="%s<|endofprompt|>" % instr,
+                                             # CosyVoice3 instruct2 REQUIRES the official
+                                             # wrapper "You are a helpful assistant. <instruction>
+                                             # <|endofprompt|>" (instruct_list in
+                                             # cosyvoice/utils/common.py); a bare phrase
+                                             # gets read aloud as part of the audio.
+              instruct_text="You are a helpful assistant. %s<|endofprompt|>" % instr,
                                              prompt_wav=ref,
                                              stream=False,
                                              text_frontend=TEXT_FRONTEND)

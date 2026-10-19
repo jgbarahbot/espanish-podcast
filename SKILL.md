@@ -1,6 +1,6 @@
 ---
 name: espanish-podcast
-version: 2.3.0
+version: 2.4.0
 description: "Use when synthesizing a Spanish podcast MP3 from a script."
 author: Jesus Gonzalez-Barahona
 license: MIT
@@ -115,10 +115,20 @@ A [solemne]: Esto ha sido IA Abierta Hoy.
 - **Instruction format (critical):** a SHORT **ENGLISH** phrase in the
   `"Speak in a … tone."` / `"Talk …"` pattern, e.g. `"Speak in a very happy
   and energetic tone."`, `"Talk slowly and crying"`, `"agitated, scared"`.
-  The worker appends the mandatory `<|endofprompt|>` for you. NO Spanish,
-  NO long sentences — anything beyond a short phrase leaks into the audio
-  (the Qwen LLM reads the instruction out loud). Keep `INSTRUCT` in
-  `cosyvoice_worker.py` to this pattern when you add/change tones.
+  NO Spanish, NO long sentences. The worker ALWAYS wraps the instruction in
+  the OFFICIAL CosyVoice3 prefix — `You are a helpful assistant.
+  <instruction><|endofprompt|>` (the exact format of `instruct_list` in
+  `cosyvoice/utils/common.py`). **A bare phrase without this wrapper gets
+  read out loud at the start of the block** (bug found 2026-10-19: the MP3
+  began with an audible "…cheerfully and la…"). When you add/change tones or
+  touch `instruct2` calls, keep both: the short-phrase pattern AND the
+  prefix.
+- **Verify every generated MP3 (v2.4.0):** transcribe the first and last
+  blocks and check no English instruction text is audible. Tool: faster-whisper
+  (model `Systran/faster-whisper-medium`, already downloaded in
+  `~/.cache/huggingface`) with the Python 3.14 venv at
+  `/home/jgb/.hermes/installs/d6a27a1debcdb2b5/environments/87801bca3da147548792a18b93c00f82/venv/bin/python`
+  (script template: `/tmp/transcribe_block.py` or `whisper`-style ad-hoc).
 - **Raw English instructions in the script (v2.3.0):** instead of (or in
   addition to) the Spanish keys, a tag may be the instruction itself —
   `A [Speak cheerfully and loud]: ...`. The worker's `resolve_instruct()`
@@ -135,8 +145,12 @@ A [solemne]: Esto ha sido IA Abierta Hoy.
   voice), so emotional blocks sound a bit less like the neutral voice —
   known, accepted.
 - Voices A/C are **cloned from reference clips**
-  `~/.hermes/cache/cosyvoice/refA.wav` / `refC.wav` (24 kHz). Current refs:
-  A = the user's own voice (12 s), C = a female reference (6.8 s). `--voice-a`
+  `~/.hermes/cache/cosyvoice/refA.wav` / `refC.wav` (24 kHz). Current refs
+  (re-pointed 2026-10-19): A = the user's own voice (12 s, `ref_user.wav`),
+  C = the female reference (6.85 s, `ref_F.wav`). NEVER point refA/refC at
+  any other clip — the 2026-10-19 bug was exactly this (they were stale
+  Piper clones: `refA.wav.piper-davefx.bak`, `refC.wav.piper-claude.bak`).
+  `--voice-a`
   / `--voice-c` (Piper paths) are still accepted as the source for
   regenerating the reference clips.
 - **CPU cost:** `OMP_NUM_THREADS=4` MANDATORY (the worker sets it itself,
