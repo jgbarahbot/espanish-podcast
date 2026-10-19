@@ -20,6 +20,7 @@ Run with the cosyvoice venv:  ~/.hermes/venvs/cosyvoice/bin/python
 """
 import json
 import os
+import re
 import sys
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -45,17 +46,42 @@ import torchaudio  # noqa: E402
 from cosyvoice.cli.cosyvoice import AutoModel  # noqa: E402
 
 # Short ENGLISH emotion instructions (long/Spanish ones bleed into the audio).
+# Format: brief "Speak in a ... tone." / "Talk ..." phrases — the verified
+# pattern for CosyVoice3 instruct2 (2026-10-19 GPU tests).
 INSTRUCT = {
-    "alegre": "cheerful",
-    "animado": "cheerful",
-    "solemne": "solemn",
-    "serio": "serious",
-    "calmo": "calm",
-    "sorpresa": "surprised",
-    "curiosidad": "curious",
-    "urgencia": "urgent",
-    "cierre": "warm",
+    "alegre": "Speak in a very happy and energetic tone.",
+    "animado": "Speak in a very happy and energetic tone.",
+    "solemne": "Speak in a slow and solemn tone.",
+    "serio": "Speak in a serious and grave tone.",
+    "calmo": "Speak in a calm and soft tone.",
+    "sorpresa": "Speak in an excited and surprised tone.",
+    "curiosidad": "Speak with curiosity, as if you just found something.",
+    "urgencia": "Speak quickly and with urgency.",
+    "cierre": "Speak in a warm and friendly tone.",
 }
+
+# Script tags may also be RAW short English instructions (e.g. "Speak
+# cheerfully and loud", "agitated, scared"). Known Spanish keys map to
+# INSTRUCT; other tags are passed through ONLY if they look like a short
+# English phrase (verb-led "Speak/Talk/Say/..." or a small comma list);
+# anything else falls back to neutral so nothing leaks into the audio.
+_RAW_VERB = re.compile(r"^(speak|talk|say|read|whisper|cry|shout|mutter|laugh)\b", re.I)
+_RAW_LIST = re.compile(r"^[A-Za-z]{2,14}(?:[ ,]+[A-Za-z]{2,14}){0,3}\.?$")
+_RAW_SAFE = re.compile(r"^[A-Za-z][A-Za-z ,'().!?-]*\.?$")
+
+def resolve_instruct(emo):
+    if not emo:
+        return None
+    key = str(emo).strip().lower()
+    if key in INSTRUCT:
+        return INSTRUCT[key]
+    s = str(emo).strip()
+    if _RAW_VERB.match(s) and len(s) <= 120 and _RAW_SAFE.match(s):
+        return s
+    if _RAW_LIST.match(s):
+        return s
+    return None  # unknown/garbage -> neutral
+
 # CosyVoice3 (Qwen LLM) hard-requires <|endofprompt|> in text or prompt_text.
 PROMPT_TEXT = ("<|endofprompt|>")
 
@@ -112,9 +138,10 @@ def main():
             job = json.loads(line)
             spk, text, emo, out = job["spk"], job["text"], job.get("emotion"), job["out"]
             ref = ref_wav(spk)
-            if emo and emo in INSTRUCT:
+            instr = resolve_instruct(emo)
+            if instr is not None:
                 gen = cv.inference_instruct2(tts_text=text,
-                                             instruct_text="%s<|endofprompt|>" % INSTRUCT[emo],
+                                             instruct_text="%s<|endofprompt|>" % instr,
                                              prompt_wav=ref,
                                              stream=False,
                                              text_frontend=TEXT_FRONTEND)

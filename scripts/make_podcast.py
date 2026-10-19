@@ -224,10 +224,15 @@ def parse_blocks(path):
         if not lines:
             continue
         voice, text = "A", ""
-        m = re.match(r"^([AC])\s*:(.*)", lines[0])
+        # Speaker marker: "A" / "C" followed by an OPTIONAL [emotion] tag and
+        # the colon (e.g. "A [alegre]: ..." or "C: ..."). The old pattern
+        # ^([AC])\s*: missed the tagged form, leaving the "A [alegre]:" residue
+        # in the spoken text and defaulting to voice A.
+        m = re.match(r"^([AC])\s*(?:\[([^\[\]:]+?)\])?\s*:(.*)",
+                     lines[0])
         if m:
             voice = m.group(1)
-            lines = [m.group(2).strip()] + lines[1:]
+            lines = [m.group(3).strip()] + lines[1:]
         text = " ".join(ln for ln in lines if ln).strip()
         if not text:
             continue
@@ -237,6 +242,13 @@ def parse_blocks(path):
             if mt and mt.group(1).lower() in EMOTIONS:
                 emotion = mt.group(1).lower()
                 break
+        # An emotion tag on the speaker line ("A [alegre]:") is already captured
+        # in m.group(2); prefer it, then any [tag] in the block.
+        if not emotion and m and m.group(2):
+            t = m.group(2).strip()
+            # known key -> normalized; anything else -> raw passthrough
+            # (the worker validates: short English only, else neutral).
+            emotion = t.lower() if t.lower() in EMOTIONS else t
         text = _EMOTION_RE.sub("", text)
         text = re.sub(r"\s{2,}", " ", text).strip()
         if text:

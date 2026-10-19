@@ -1,6 +1,6 @@
 ---
 name: espanish-podcast
-version: 2.2.0
+version: 2.3.0
 description: "Use when synthesizing a Spanish podcast MP3 from a script."
 author: Jesus Gonzalez-Barahona
 license: MIT
@@ -49,7 +49,9 @@ Rules:
 
 - `A` and `C` are the only valid markers; a block without one defaults to A.
 - Optional emotion tag between marker and colon: `A [alegre]: ...`
-  (see Emotion section).
+  OR a raw English instruction: `A [Speak cheerfully and loud]: ...`
+  (see Emotion section — raw English phrases pass through to
+  `instruct2` as-is; unknown Spanish words fall back to neutral).
 - Alternate voices block by block (A, C, A, C...) for a natural conversation.
 - Natural spoken Spanish, present tense — this is speech, not an article.
 - Typical length: 15-25 blocks (about 4-6 minutes at this pace).
@@ -110,11 +112,25 @@ A [solemne]: Esto ha sido IA Abierta Hoy.
   (see `INSTRUCT` in `cosyvoice_worker.py`). Unknown/absent tone → neutral
   (`inference_zero_shot`). Use sparingly: openings/closings and the one
   genuinely serious news item; a news digest is mostly neutral.
-- **Instruction format (critical):** `"<1-2 English words><|endofprompt|>"`
-  (e.g. `"cheerful<|endofprompt|>"`). NO prefix sentences, NO Spanish, NO
-  long descriptions — anything longer leaks into the audio (the Qwen LLM
-  reads the instruction out loud). "shouting"/"screaming" words cause
-  repetition; use "extremely angry, raising your voice" if needed.
+- **Instruction format (critical):** a SHORT **ENGLISH** phrase in the
+  `"Speak in a … tone."` / `"Talk …"` pattern, e.g. `"Speak in a very happy
+  and energetic tone."`, `"Talk slowly and crying"`, `"agitated, scared"`.
+  The worker appends the mandatory `<|endofprompt|>` for you. NO Spanish,
+  NO long sentences — anything beyond a short phrase leaks into the audio
+  (the Qwen LLM reads the instruction out loud). Keep `INSTRUCT` in
+  `cosyvoice_worker.py` to this pattern when you add/change tones.
+- **Raw English instructions in the script (v2.3.0):** instead of (or in
+  addition to) the Spanish keys, a tag may be the instruction itself —
+  `A [Speak cheerfully and loud]: ...`. The worker's `resolve_instruct()`
+  resolves tags in three ways: (1) known Spanish key → its `INSTRUCT`
+  English phrase; (2) raw English phrase (verb-led `Speak/Talk/Say/…`,
+  ≤120 chars, or a short comma list like `agitated, scared`) → passed
+  through verbatim; (3) anything else (Spanish words, garbage, empty) →
+  neutral zero-shot, so it can never leak into the audio. The parser in
+  `make_podcast.py`/`podcast_gpu.py` accepts any tag text inside `[…]`
+  on the marker line (the emotion field carries it to the worker).
+  PREFERRED in new scripts: write the English instruction directly in the
+  tag — it is exactly what the model hears, no indirection.
 - **`instruct2` clones only the TIMBRE** of the reference (not its full
   voice), so emotional blocks sound a bit less like the neutral voice —
   known, accepted.
@@ -201,9 +217,10 @@ ffprobe -v error -show_entries format=duration,bit_rate -of default=nw=1 <out.mp
   (~7.9 GiB → lower); the fix for the cap is `podcast_systemd.sh`
   (MemoryMax=8G) or `--engine piper`. Never synthesize blocks in parallel
   anyway (CPU-bound).
-- **Emotion instructions: short English + `<|endofprompt|>` only.** Long or
-  Spanish instructions bleed into the audio; "shouting/screaming" cause
-  repetition.
+- **Emotion instructions: short ENGLISH + `<|endofprompt|>` only** (the
+  `"Speak in a … tone."` / `"Talk …"` pattern; the worker appends
+  `<|endofprompt|>` automatically). Long or Spanish instructions bleed into
+  the audio; "shouting/screaming" cause repetition.
 - **`inference_instruct2` yields single items, not tuples:** iterate
   `for chunk in gen`, never `for _, chunk in`.
 - **`CosyVoice3()` takes `load_trt`/`load_vllm`/`fp16`** — there is no
