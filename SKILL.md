@@ -1,6 +1,6 @@
 ---
 name: espanish-podcast
-version: 2.5.0
+version: 2.6.0
 description: "Use when synthesizing a Spanish podcast MP3 from a script."
 author: Jesus Gonzalez-Barahona
 license: MIT
@@ -160,6 +160,22 @@ A [solemne]: Esto ha sido IA Abierta Hoy.
   `--voice-a`
   / `--voice-c` (Piper paths) are still accepted as the source for
   regenerating the reference clips.
+- **Reference loudness must be equalized (2026-10-20):** a reference clip's
+  integrated loudness leaks into the output — a quieter ref makes that
+  voice's blocks quieter. On 2026-10-20 A's ref (the user's own voice, a
+  low-level 12 s clip, −29 LUFS with a wide 12 dB range) was ~9 dB below C's
+  (−20 LUFS), so A's blocks came out −11.6 dB (RMS) below C's (C sounded
+  ~3.8× the power of A) — the user heard it as "A is quieter than C". Fix:
+  loudness-normalize BOTH refs to the same target (−20 LUFS) with ffmpeg
+  `loudnorm` 2-pass `linear=true`; for a WIDE-range ref (high LRA) add
+  `acompressor=threshold=-28dB:ratio=4:knee=6dB:attack=5:release=80` BEFORE
+  the 2nd pass or the linear gain is peak-limited (plain 2-pass only reached
+  −23 LUFS on the male clip). Pitch is preserved (autocorrelation F0: A
+  102.8, C 181.8 Hz — unchanged after the fix; verify it, don't trust it).
+  After the fix a CPU/fp32 A-vs-C sample landed at −18.5 dB vs −13.6 dB
+  (gap 4.4 dB, within the normal male/female pitch-energy range). Backups:
+  `refA.wav.bak-predyn` / `refC.wav.bak-predyn`; the untouched source clips
+  are `ref_user.wav` / `ref_F2.wav`.
 - **CPU cost:** `OMP_NUM_THREADS=4` MANDATORY (the worker sets it itself,
   before importing torch — libgomp reads it at import time; a later
   `torch.set_num_threads` is too late). ~70-107 s per block on i7-12700H
@@ -261,6 +277,12 @@ ffprobe -v error -show_entries format=duration,bit_rate -of default=nw=1 <out.mp
   piper; CosyVoice: as JSON lines to the worker).
 - `pkill -f "<worker script>"` can match the calling shell and kill it; use
   `pgrep -v` to verify before killing.
+- **If one voice sounds quieter than the other, check the REFERENCE clips
+  first (2026-10-20):** the loudness gap between the two ref clips propagates
+  to the output 1:1. Equalize both refs to the same integrated loudness (−20
+  LUFS, 2-pass `linear=true`, compressor first for wide-range refs — see the
+  reference-loudness note in the Emotion section) and re-synthesize. It took
+  the A↔C output gap from 11.6 dB to 4.4 dB without touching the model.
 
 ## Keeping this skill in sync with GitHub
 This directory is a git repo tracking `jgbarahbot/espanish-podcast`. After any local edit, run `./sync.sh` (commits, fast-forwards, and pushes using `GITHUB_CONTENT_RW_TOKEN` from `~/.hermes/.env` — read it with `grep '^GITHUB_CONTENT_RW_TOKEN=' ~/.hermes/.env | cut -d= -f2- | tr -d '\r'`, never `source .env`, and push as `jgbarahbot`, never `x-access-token`).
