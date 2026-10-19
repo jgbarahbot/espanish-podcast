@@ -8,8 +8,10 @@ Progress (stdout, one JSON per line):
     {"ok": <path>}
     {"error": <msg>}
 
-Emotion is expressed via inference_instruct2 (voice cloning from a 5-10 s
-reference clip + a SHORT ENGLISH instruction); no emotion -> inference_zero_shot.
+ALL blocks go through inference_instruct2 (2026-10-19 user decision):
+both voice references clone reliably via instruct2, while zero-shot
+collapsed on the 8 s female reference. Emotion = a SHORT ENGLISH
+instruction; untagged blocks get a neutral default phrase.
 Short (1-2 word) English instructions are required: long or Spanish
 instructions bleed into the audio (the Qwen LLM reads them out loud).
 
@@ -120,9 +122,11 @@ def main():
     emit({"ready": True, "sr": cv.sample_rate})
 
     # Warmup once: first synthesis after load is slower (kernel/caches).
+    # Uses instruct2 (not zero-shot) so it stays reliable with the F2 female
+    # reference, which collapses under zero-shot on this model.
     try:
-        for _ in cv.inference_zero_shot(tts_text="Carga inicial.",
-                                        prompt_text=PROMPT_TEXT,
+        for _ in cv.inference_instruct2(tts_text="Carga inicial.",
+                                        instruct_text="You are a helpful assistant. %s<|endofprompt|>" % "Speak in a natural and relaxed tone.",
                                         prompt_wav=ref_wav("A"),
                                         text_frontend=TEXT_FRONTEND):
             pass
@@ -139,23 +143,21 @@ def main():
             spk, text, emo, out = job["spk"], job["text"], job.get("emotion"), job["out"]
             ref = ref_wav(spk)
             instr = resolve_instruct(emo)
-            if instr is not None:
-                gen = cv.inference_instruct2(tts_text=text,
-                                             # CosyVoice3 instruct2 REQUIRES the official
-                                             # wrapper "You are a helpful assistant. <instruction>
-                                             # <|endofprompt|>" (instruct_list in
-                                             # cosyvoice/utils/common.py); a bare phrase
-                                             # gets read aloud as part of the audio.
-              instruct_text="You are a helpful assistant. %s<|endofprompt|>" % instr,
-                                             prompt_wav=ref,
-                                             stream=False,
-                                             text_frontend=TEXT_FRONTEND)
-            else:
-                gen = cv.inference_zero_shot(tts_text=text,
-                                             prompt_text=PROMPT_TEXT,
-                                             prompt_wav=ref,
-                                             stream=False,
-                                             text_frontend=TEXT_FRONTEND)
+            # User decision (2026-10-19): BOTH voices always go through
+            # inference_instruct2 (see gpu_worker.py); the 8 s female
+            # reference makes zero-shot collapse to ~0.1 s clips.
+            if instr is None:
+                instr = "Speak in a natural and relaxed tone."
+            gen = cv.inference_instruct2(tts_text=text,
+                                         # CosyVoice3 instruct2 REQUIRES the official
+                                         # wrapper "You are a helpful assistant. <instruction>
+                                         # <|endofprompt|>" (instruct_list in
+                                         # cosyvoice/utils/common.py); a bare phrase
+                                         # gets read aloud as part of the audio.
+                                         instruct_text="You are a helpful assistant. %s<|endofprompt|>" % instr,
+                                         prompt_wav=ref,
+                                         stream=False,
+                                         text_frontend=TEXT_FRONTEND)
             full = None
             for chunk in gen:
                 seg = chunk["tts_speech"]

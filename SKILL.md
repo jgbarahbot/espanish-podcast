@@ -1,6 +1,6 @@
 ---
 name: espanish-podcast
-version: 2.4.0
+version: 2.5.0
 description: "Use when synthesizing a Spanish podcast MP3 from a script."
 author: Jesus Gonzalez-Barahona
 license: MIT
@@ -97,21 +97,26 @@ Wrap any English word/phrase in asterisks: `*notebook*`, `*Hugging Face*`,
 ## Emotion / intonation (CosyVoice3, default engine)
 
 The default engine is **CosyVoice3 (Fun-CosyVoice3-0.5B-2512)** (runs on
-CPU, 24 kHz). It **clones both voices** from reference clips and supports
-per-block emotion via `inference_instruct2` with a **SHORT ENGLISH**
-instruction:
+CPU, 24 kHz). It **clones both voices** from reference clips. **EVERY block
+goes through `inference_instruct2`** (user decision 2026-10-19): with the
+current 8 s female reference, `inference_zero_shot` collapses to ~0.1 s
+clips (reproduced 3/3), while instruct2 clones both voices reliably — so
+untagged blocks use the neutral default phrase
+`"Speak in a natural and relaxed tone."` instead of zero-shot. Emotion is
+a **SHORT ENGLISH** instruction:
 
 ```text
-A [alegre]: Bienvenidos a IA Abierta Hoy...
-C: ...
+A [Speak cheerfully and loud]: Bienvenidos a IA Abierta Hoy...
+C [Speak in a clear and informative tone.]: ...
 A [solemne]: Esto ha sido IA Abierta Hoy.
 ```
 
 - Emotion tag on the same line: `A [tono]: texto`. Valid tones: `alegre`,
   `solemne`, `serio`, `calmo`, `sorpresa`, `curiosidad`, `urgencia`, `cierre`
   (see `INSTRUCT` in `cosyvoice_worker.py`). Unknown/absent tone → neutral
-  (`inference_zero_shot`). Use sparingly: openings/closings and the one
-  genuinely serious news item; a news digest is mostly neutral.
+  default phrase (still via instruct2). Since v2.5.0 the podcast scripts
+  TAG EVERY BLOCK with a reasonable emotion so the two voices read as a
+  live conversation.
 - **Instruction format (critical):** a SHORT **ENGLISH** phrase in the
   `"Speak in a … tone."` / `"Talk …"` pattern, e.g. `"Speak in a very happy
   and energetic tone."`, `"Talk slowly and crying"`, `"agitated, scared"`.
@@ -136,7 +141,7 @@ A [solemne]: Esto ha sido IA Abierta Hoy.
   English phrase; (2) raw English phrase (verb-led `Speak/Talk/Say/…`,
   ≤120 chars, or a short comma list like `agitated, scared`) → passed
   through verbatim; (3) anything else (Spanish words, garbage, empty) →
-  neutral zero-shot, so it can never leak into the audio. The parser in
+  the neutral default phrase, so it can never leak into the audio. The parser in
   `make_podcast.py`/`podcast_gpu.py` accepts any tag text inside `[…]`
   on the marker line (the emotion field carries it to the worker).
   PREFERRED in new scripts: write the English instruction directly in the
@@ -146,10 +151,12 @@ A [solemne]: Esto ha sido IA Abierta Hoy.
   known, accepted.
 - Voices A/C are **cloned from reference clips**
   `~/.hermes/cache/cosyvoice/refA.wav` / `refC.wav` (24 kHz). Current refs
-  (re-pointed 2026-10-19): A = the user's own voice (12 s, `ref_user.wav`),
-  C = the female reference (6.85 s, `ref_F.wav`). NEVER point refA/refC at
-  any other clip — the 2026-10-19 bug was exactly this (they were stale
-  Piper clones: `refA.wav.piper-davefx.bak`, `refC.wav.piper-claude.bak`).
+  (re-pointed twice on 2026-10-19): A = the user's own voice (12 s,
+  `ref_user.wav`), C = the female reference (8 s voice message, saved as
+  `ref_F2.wav`; the earlier 6.85 s `ref_F.wav` was NOT the voice the user
+  meant — backups: `refC.wav.piper-claude.bak`, `refC.wav.ref-F.bak`).
+  NEVER point refA/refC at any other clip — the 2026-10-19 bug was exactly
+  this (they were stale Piper clones: `refA.wav.piper-davefx.bak`).
   `--voice-a`
   / `--voice-c` (Piper paths) are still accepted as the source for
   regenerating the reference clips.
@@ -191,8 +198,9 @@ not help (it's the model weights). Two working routes:
 Success output: `OK podcast <out> (<bytes> bytes, <N> blocks, <nA> A / <nC> C, <nEmo> emotion, <engine>, <secs>s)`.
 
 Pipeline (cosy): each block → `cosyvoice_worker.py` (stdin JSON protocol) →
-`inference_instruct2` (emotion) or `inference_zero_shot` (neutral), both with
-named params (`tts_text=, prompt_text=/instruct_text=, prompt_wav=,
+`inference_instruct2` for EVERY block (emotion or the neutral default
+phrase; zero-shot is no longer used — it collapses on the 8 s female
+reference), with named params (`tts_text=, instruct_text=, prompt_wav=,
 stream=False, text_frontend=False`) → wav → concatenate with 380 ms silence →
 `libmp3lame` MP3 (VBR q3, 24 kHz mono). Piper pipeline: piper per block →
 resample 22050 Hz → same concat/MP3.
