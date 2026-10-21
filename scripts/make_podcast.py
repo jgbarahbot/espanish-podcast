@@ -72,6 +72,30 @@ CV_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 CV_REF_DIR = os.path.join(HOME, ".hermes", "cache", "cosyvoice")
 CV_SR = 24000
 
+# Qwen3-TTS (Qwen3-TTS-12Hz-1.7B-Base, voice-clone, NO per-block emotion) —
+# worker + model + refs. Same JSON protocol and 24 kHz output as CosyVoice.
+# CPU: fp32 (the working 2026-10-21 config, ~2 min/block). bf16 on this i7
+# box is 4x SLOWER on CPU (122s->300s+ observed); use it only on GPU.
+# Peak RSS is ~11 GiB, so run in a MemoryMax>=12G systemd unit, not inside a
+# 4 GiB Hermes worker scope (it would OOM).
+# In-container (GPU): the target script sets QWEN3_DEVICE=cuda:0 +
+# QWEN3_DTYPE=bf16 (SDPA, no flash-attn needed).
+# The worker needs Python 3.12 (qwen-tts hard-dep); default to the dedicated
+# host venv, not the orquestrator's interpreter.
+QW_PY = os.environ.get("QWEN3_PYTHON",
+                       os.path.join(HOME, ".hermes", "venvs", "qwen3tts",
+                                    "bin", "python"))
+QW_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "qwen3_worker.py")
+QW_MODEL = os.environ.get("QWEN3_MODEL",
+                          os.path.join(HOME, ".hermes", "cache", "qwen3-tts",
+                                       "model"))
+QW_REFS = os.environ.get("QWEN3_REFS",
+                         os.path.join(HOME, ".hermes", "cache", "qwen3-tts"))
+QW_DEVICE = os.environ.get("QWEN3_DEVICE", "cpu")
+QW_DTYPE = os.environ.get("QWEN3_DTYPE", "fp32")
+QW_SR = 24000
+
 # Piper reference clip (seconds) used to seed the CosyVoice clone refs.
 REF_SEED_TEXTS = {
     "A": "Bienvenidos a iaahoy, el diario de la inteligencia artificial. Hoy repasamos las noticias del mundo de los modelos de lenguaje.",
@@ -360,6 +384,66 @@ def synth_cosyworker(worker, out_dir, idx, spk, text, emotion):
     return worker.synth(out, spk, text, emotion)
 
 
+class QwenWorker:
+    """Long-lived Qwen3-TTS worker subprocess (JSON over stdin/stdout).
+
+    Same protocol as CosyWorker, same 24 kHz mono output. The model has NO
+    instruction channel (Base variant), so the emotion field is ignored —
+    the worker simply clones each voice from refA.wav / refC.wav (ICL mode:
+    ref clip + its transcript). The worker builds both voice-clone prompts
+    once after load and reuses them for every block of that speaker.
+
+    CPU (host): fp32, device=cpu — the working config of the 2026-10-21
+    smoke test (~120 s/block on i7-12700H; slower than CosyVoice CPU, which
+    is why production podcasts use the GPU container path instead).
+    """
+
+    def __init__(self, worker_py, worker, model_dir, ref_dir,
+                 device="cpu", dtype="fp32", timeout=600):
+        env = dict(os.environ, OMP_NUM_THREADS="4",
+                   QWEN3_MODEL=model_dir, QWEN3_REFS=ref_dir,
+                   QWEN3_DEVICE=device, QWEN3_DTYPE=dtype)
+        self.proc = subprocess.Popen([worker_py, worker],
+                                     stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL,
+                                     env=env, text=True, bufsize=1)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line = self.proc.stdout.readline()
+            if not line:
+                break
+            msg = json.loads(line)
+            if msg.get("ready"):
+                self.sr = msg.get("sr", QW_SR)
+                return
+            if "warmup_error" in msg:
+                print("WARNING: Qwen3 warmup: %s" % msg["warmup_error"])
+        raise SystemExit("ERROR: Qwen3 worker did not become ready (load timeout)")
+
+    def synth(self, out, spk, text, emotion=None):
+        # emotion is intentionally dropped: the Base model cannot express it.
+        job = {"spk": spk, "text": text, "emotion": None, "out": out}
+        self.proc.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise SystemExit("ERROR: Qwen3 worker died (pid=%s)" % self.proc.pid)
+            msg = json.loads(line)
+            if msg.get("ok"):
+                return msg["ok"]
+            if "error" in msg:
+                raise SystemExit("ERROR: Qwen3 synthesis failed: %s" % msg["error"])
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=30)
+        except Exception:
+            self.proc.kill()
+
+
 def assemble(wavs, gap_s, sr, out_mp3):
     tmp = os.path.abspath(out_mp3 + ".build")
     os.makedirs(tmp, exist_ok=True)
@@ -392,9 +476,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--script", required=True, help="path to two-voice Spanish script")
     ap.add_argument("--out", required=True, help="output MP3 path")
-    ap.add_argument("--engine", choices=("cosy", "piper"), default="cosy",
+    ap.add_argument("--engine", choices=("cosy", "piper", "qwen"), default="cosy",
                     help="TTS engine: cosy=cosyvoice (emotion, CPU, slower), "
-                         "piper=local piper (fast, no emotion)")
+                         "piper=local piper (fast, no emotion), "
+                         "qwen=qwen3-tts 1.7B voice-clone (CPU fp32, no emotion)")
     ap.add_argument("--voice-a", default=VOICE_A, help="davefx voice model (piper/seed)")
     ap.add_argument("--voice-c", default=VOICE_C, help="Claude voice model (piper/seed)")
     ap.add_argument("--only", nargs=2, type=int, metavar=("START", "END"),
@@ -423,7 +508,7 @@ def main():
         print("ERROR: --only %d %d out of range (1..%d)" % (args.only[0], args.only[1], n))
         sys.exit(1)
 
-    sr = CV_SR if args.engine == "cosy" else 22050
+    sr = CV_SR if args.engine in ("cosy", "qwen") else 22050
     tmp = os.path.abspath(args.out + ".build")
     if args.clean:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -467,6 +552,55 @@ def main():
                                              spanish_digits(mark_english(text, pron_dict)), emotion))
                 print("block %02d %s%s %6.1fs" %
                       (i, voice, " [%s]" % emotion if emotion else "", time.time() - t))
+        finally:
+            worker.close()
+        if do_assemble:
+            assemble(wavs, GAP_S, sr, args.out)
+            shutil.rmtree(tmp, ignore_errors=True)
+            size = os.path.getsize(args.out)
+            print("OK podcast %s (%d bytes, %d blocks, %d A / %d C, %d emotion, %s, %.0fs)"
+                  % (args.out, size, n, counts["A"], counts["C"],
+                     n_emo, args.engine, time.time() - t0))
+        else:
+            print("chunk done: blocks %d-%d synthesized into %s (%.0fs)"
+                  % (args.only[0], args.only[1], tmp, time.time() - t0))
+            print("NEXT: run --only <next range> for the remaining blocks, then "
+                  "--assemble once blocks 1-%d all exist" % n)
+    elif args.engine == "qwen":
+        # Qwen3-TTS voice-clone (Base: no emotion). Same JSON worker protocol
+        # and 24 kHz output as CosyVoice, so the assemble path is unchanged.
+        # Emotion tags in the script are dropped (the model can't express them).
+        for need, label in ((QW_WORKER, "worker %s" % QW_WORKER),
+                            (QW_MODEL, "model %s" % QW_MODEL)):
+            if not os.path.exists(need):
+                print("ERROR: qwen3-tts unavailable: missing %s" % label)
+                sys.exit(1)
+        for spk in SPEAKERS:
+            ref = os.path.join(QW_REFS, "ref%s.wav" % spk)
+            if not os.path.exists(ref):
+                print("ERROR: qwen3-tts reference clip missing: %s" % ref)
+                sys.exit(1)
+        print("NOTE: qwen3-tts has no emotion channel; %d emotion tag(s) "
+              "ignored" % n_emo)
+        worker = QwenWorker(QW_PY, QW_WORKER, QW_MODEL, QW_REFS,
+                            device=QW_DEVICE, dtype=QW_DTYPE)
+        sr = worker.sr
+        print("qwen3-tts ready (sr=%d, device=%s, dtype=%s)"
+              % (sr, QW_DEVICE, QW_DTYPE))
+        wavs = []
+        try:
+            for i, (voice, emotion, text) in enumerate(blocks, 1):
+                if args.only and not (args.only[0] <= i <= args.only[1]):
+                    continue
+                out = os.path.join(tmp, "blk_%02d.wav" % i)
+                if os.path.exists(out) and os.path.getsize(out) > 1000:
+                    print("  block %02d already done, skipping" % i)
+                    wavs.append(out)
+                    continue
+                t = time.time()
+                wavs.append(worker.synth(out, voice,
+                                         spanish_digits(mark_english(text, pron_dict))))
+                print("block %02d %s %6.1fs" % (i, voice, time.time() - t))
         finally:
             worker.close()
         if do_assemble:
