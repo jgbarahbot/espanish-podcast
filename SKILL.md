@@ -361,6 +361,10 @@ ffprobe -v error -show_entries format=duration,bit_rate -of default=nw=1 <out.mp
   qwen-tts` pulls the FULL package (both tokenizers), so onnxruntime/sox/
   einops are hard deps; torch/torchaudio/numpy must be pinned (constraints)
   so the resolver does not downgrade the CUDA build.
+- **CPU dtype is fp32, not bf16 (2026-10-21):** bf16 on this i7-12700H was
+  4x SLOWER per block (122 s vs 300 s+). CPU fp32 peaks at ~11 GiB RSS, so
+  run `--engine qwen` in a `MemoryMax=12G` systemd unit — an 8 GiB unit OOMs
+  during load.
 - **The qwen_tts import prints a "flash-attn is not installed" banner to
   STDOUT (2026-10-21)** — it corrupts the worker's stdout JSON protocol on
   the first read (`JSONDecodeError` in `QwenWorker.__init__`). The worker now
