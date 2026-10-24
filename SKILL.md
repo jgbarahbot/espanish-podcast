@@ -250,7 +250,15 @@ this path, though `spanish_digits()` (numbers in Spanish) still applies.
    for short tests or single-block A/Bs, not whole episodes (the GPU path
    is the real one). Peak RSS is ~11 GiB for clone / ~8 GiB for design:
    run it in a `MemoryMax=12G` systemd unit (fp32 OOMs an 8 GiB unit),
-   never inside a 4 GiB Hermes worker scope.
+   never inside a 4 GiB Hermes worker scope. **Validated 2026-10-25** in a
+   `systemd-run --user --property=MemoryMax=12G` unit running the worker
+   directly: both modes loaded and synthesized cleanly (design ~1.8G at
+   load, 5.2 s + 3.8 s blocks; clone 5.3 s + 3.1 s; all 24 kHz mono,
+   −19 to −25 dB RMS). An in-worker run of the same command dies with
+   exit 137 at ~1.88G — that is the 4 GiB worker cap, not a model bug.
+   (The `SoX could not be found!` banner on stderr is cosmetic: the 12 Hz
+   tokenizer never imports sox — only the unused 25 Hz path does; synthesis
+   and the JSON protocol are unaffected.)
 
 ### Worker config (`qwen3_worker.py`)
 
