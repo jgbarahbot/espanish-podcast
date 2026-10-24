@@ -1,11 +1,11 @@
 ---
 name: espanish-podcast
-version: 2.7.0
+version: 2.9.0
 description: "Use when synthesizing a Spanish podcast MP3 from a script."
 author: Jesus Gonzalez-Barahona
 license: MIT
 requires:
-  - "ffmpeg; CosyVoice3 (Fun-CosyVoice3-0.5B-2512) under ~/.hermes/cache/cosyvoice/ (default engine) OR piper + piper voices in ~/.hermes/cache/piper-voices/ (fallback --engine piper) OR Qwen3-TTS 1.7B-Base under ~/.hermes/cache/qwen3-tts/ (--engine qwen / GPU swap)"
+  - "ffmpeg; Qwen3-TTS 1.7B-Base under ~/.hermes/cache/qwen3-tts/ (default engine, --engine qwen / GPU swap) OR CosyVoice3 (Fun-CosyVoice3-0.5B-2512) under ~/.hermes/cache/cosyvoice/ (emotion variant, --engine cosy) OR piper + piper voices in ~/.hermes/cache/piper-voices/ (fallback --engine piper)"
 ---
 
 # Spanish two-voice podcast
@@ -19,7 +19,7 @@ requires:
   podcasts (voices are Spanish; English terms are spoken in English).
 
 Turn a Spanish script written by the agent into ONE MP3 with two local voices
-alternating (CosyVoice3 cloned voices by default, with per-block emotion),
+alternating (Qwen3-TTS 1.7B-Base cloned voices by default, no per-block emotion),
 English terms pronounced in English, all numbers spoken in Spanish. Fully
 offline.
 
@@ -94,10 +94,10 @@ Wrap any English word/phrase in asterisks: `*notebook*`, `*Hugging Face*`,
    `16 bits` → "dieciséis bits". Ranges `a-b` are split and converted
    separately.
 
-## Emotion / intonation (CosyVoice3, default engine)
+## Emotion / intonation (CosyVoice engine, `--engine cosy`)
 
-The default engine is **CosyVoice3 (Fun-CosyVoice3-0.5B-2512)** (runs on
-CPU, 24 kHz). It **clones both voices** from reference clips. **EVERY block
+The CosyVoice engine is **CosyVoice3 (Fun-CosyVoice3-0.5B-2512)** (runs on
+CPU, 24 kHz; `--engine cosy`). It **clones both voices** from reference clips. **EVERY block
 goes through `inference_instruct2`** (user decision 2026-10-19): with the
 current 8 s female reference, `inference_zero_shot` collapses to ~0.1 s
 clips (reproduced 3/3), while instruct2 clones both voices reliably — so
@@ -183,58 +183,97 @@ A [solemne]: Esto ha sido IA Abierta Hoy.
 - One worker process (lazy-loaded, ~1 min warmup on CPU) — never fork per
   block. Worker env: `CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=4`.
 
-## Qwen3-TTS engine (`--engine qwen`) — no emotion, two cloned voices
+## Qwen3-TTS engine (`--engine qwen` / `--engine qwen-syn`) — DEFAULT
 
-A second TTS engine, added 2026-10-21: **Qwen3-TTS-12Hz-1.7B-Base** (4.5 GB,
-self-contained — the 12 Hz speech tokenizer ships inside the model dir). It
-clones both voices A/C from the same reference clips (ICL mode: ref clip + its
-transcript) but **has NO per-block emotion** — the Base model has no
-instruction channel, so every `[emotion]` tag in the script is silently
-dropped. This is the engine to use when you want the two real voices but do
-not need per-block tone control.
+The default engine (2026-10-24): **Qwen3-TTS-12Hz-1.7B-Base** (7.2 GB,
+self-contained — the 12 Hz speech tokenizer ships inside the model dir).
+It clones both voices A/C from the same reference clips (ICL mode: ref
+clip + its transcript) but **has NO per-block emotion** — the Base model
+has no instruction channel, so every `[emotion]` tag in the script is
+silently dropped. This is the engine to use when you want the two real
+voices but do not need per-block tone control.
 
-Output is **24 kHz mono**, identical to CosyVoice, so the assembly path
-(380 ms gap → `libmp3lame` MP3) is unchanged. English terms are read natively
-(the model is multilingual) — no `pron_dict` needed on this path, though
-`spanish_digits()` (numbers in Spanish) still applies.
+A **second Qwen3-TTS engine** (`--engine qwen-syn`) uses the
+**Qwen3-TTS-12Hz-1.7B-VoiceDesign** checkpoint (4.3 GB, a separate model
+dir at `~/.hermes/cache/qwen3-tts-voicedesign/model/`). It is **100%
+synthetic** — no cloning, no ref clips: each voice is described in English
+(Madrid narrator, male A / female C, Castilian accent) and per-block emotion
+is appended to the description in English. Output is 24 kHz mono.
 
-Two ways to run it:
+| Engine | Model | Refs? | Emotion? | Use case |
+|---|---|---|---|---|
+| `qwen` (default) | Base 7.2 GB | refA/refC wav+txt | No (ignored) | Two real cloned voices, neutral |
+| `qwen-syn` | VoiceDesign 4.3 GB | None | Yes (via description) | Described voices, per-block emotion |
+| `cosy` | CosyVoice3 0.5B | refA/refC wav | Yes (instruct2) | Two cloned voices, emotion |
+| `piper` | Piper .onnx | .onnx voice files | No | Fast CPU fallback |
+
+Both Qwen3 engines output **24 kHz mono**, identical to CosyVoice, so the
+assembly path (380 ms gap → `libmp3lame` MP3) is unchanged. English terms
+are read natively (the model is multilingual) — no `pron_dict` needed on
+this path, though `spanish_digits()` (numbers in Spanish) still applies.
+
+### Running (both Qwen3 engines)
 
 1. **GPU (production, the fast path) — the `hyperqwen-gpu-swap` flow.**
    A detached `systemd-run --user` job stops HyperQwen, runs the day's script
    in the `qwen3-tts:local` podman container (bf16 + SDPA, ~3-4 s/block on
    the RTX 3090 → a 4-5 min podcast in ~3-4 min total), then restarts vLLM:
    ```bash
+   # clone mode (default)
    systemd-run --user --unit=gpu-swap-qwen3-podcast \
      --property=TimeoutStartSec=0 --property=KillMode=process \
      bash ~/.hermes/gpu-swaps/qwen3-podcast-gpu-swap.sh \
-     /abs/path/<TODAY>.podcast.txt /abs/path/podcast.mp3   # add `--no-publish` to only synth
+     /abs/path/<TODAY>.podcast.txt /abs/path/podcast.mp3
+   # design mode (synthetic, emotion)
+   systemd-run --user --unit=gpu-swap-qwen3-podcast \
+     --property=TimeoutStartSec=0 --property=KillMode=process \
+     bash ~/.hermes/gpu-swaps/qwen3-podcast-gpu-swap.sh \
+     --mode design \
+     /abs/path/<TODAY>.podcast.txt /abs/path/podcast.mp3
+   # add `--no-publish` (4th arg) to only synth, not publish
    ```
-   `qwen3-podcast-gpu-target.sh` mounts `~/.hermes/cache/qwen3-tts/model`
-   + the refs, copies in `qwen3_worker.py` (source of truth: this skill's
-   `scripts/`) and `qwen3_podcast.py` (`~/.hermes/projects/iaahoy/scripts/`),
-   and synthesizes + assembles the MP3, then (unless `--no-publish`) runs
-   the project `publish.py`. **End your turn right after launching** — you
-   lose your LLM in the OFF phase; the detached job finishes and restores
-   vLLM on its own. See the `hyperqwen-gpu-swap` skill for the mechanism and
-   the never-run-in-foreground rule.
-2. **CPU (fallback, in the orquestrator): `--engine qwen` on `make_podcast.py`.**
-   Runs the 1.7B model on the host CPU (fp32, `QWEN3_DEVICE=cpu` — bf16 is
+   `qwen3-podcast-gpu-target.sh` is mode-aware: `--mode clone` mounts
+   `~/.hermes/cache/qwen3-tts/model` + refs; `--mode design` mounts
+   `~/.hermes/cache/qwen3-tts-voicedesign/model` (no refs). It copies in
+   `qwen3_worker.py` (source of truth: this skill's `scripts/`),
+   `qwen3_podcast.py` (`~/.hermes/projects/iaahoy/scripts/`), and the day's
+   script, synthesizes + assembles the MP3, then (unless `--no-publish`)
+   runs the project `publish.py`. **End your turn right after launching** —
+   you lose your LLM in the OFF phase; the detached job finishes and
+   restores vLLM on its own. See the `hyperqwen-gpu-swap` skill for the
+   mechanism and the never-run-in-foreground rule.
+2. **CPU (fallback, in the orchestrator): `--engine qwen` or `--engine qwen-syn`
+   on `make_podcast.py`.**
+   Runs the model on the host CPU (fp32, `QWEN3_DEVICE=cpu` — bf16 is
    4x SLOWER on this i7, use it only on the GPU path). Same JSON worker
-   protocol. ~1-2 min/block (122 s + 44 s for a 2-block test), so a full
-   podcast takes a long time — use it for short tests or single-block A/Bs,
-   not whole episodes (the GPU path is the real one). Peak RSS is ~11 GiB:
-   run it in a `MemoryMax=12G` systemd unit (fp32 OOMs an 8 GiB unit), never
-   inside a 4 GiB Hermes worker scope.
+   protocol. ~1-2 min/block, so a full podcast takes a long time — use it
+   for short tests or single-block A/Bs, not whole episodes (the GPU path
+   is the real one). Peak RSS is ~11 GiB for clone / ~8 GiB for design:
+   run it in a `MemoryMax=12G` systemd unit (fp32 OOMs an 8 GiB unit),
+   never inside a 4 GiB Hermes worker scope.
 
-`qwen3_worker.py` (this skill's `scripts/`) is the source of truth copied into
-both the container and the host CPU path. Config env: `QWEN3_MODEL` (model
-dir), `QWEN3_REFS` (refA/refC `.wav` + `.txt`), `QWEN3_DEVICE` (`cpu` /
-`cuda:0`), `QWEN3_DTYPE` (CPU: `fp32` default — bf16 is 4x slower on this i7;
-   GPU: `bf16`),
-`QWEN3_XVEC` (0=ICL, 1=embedding-only). Attention is SDPA on GPU / eager on CPU — the 12 Hz
-tokenizer does NOT import flash-attn (only the 25 Hz one does), so there is no
-flash-attn build step.
+### Worker config (`qwen3_worker.py`)
+
+`qwen3_worker.py` (this skill's `scripts/`) is the source of truth copied
+into both the container and the host CPU path. It is **mode-aware** via the
+`QWEN3_MODE` env var:
+- `QWEN3_MODE=clone` (default): ICL voice-clone. Config env: `QWEN3_MODEL`
+  (model dir, default `/model`), `QWEN3_REFS` (refA/refC `.wav` + `.txt`),
+  `QWEN3_DEVICE` (`cpu` / `cuda:0`), `QWEN3_DTYPE` (CPU: `fp32`, GPU:
+  `bf16`), `QWEN3_XVEC` (0=ICL, 1=embedding-only), `QWEN3_LANG` (default
+  "Spanish"). Emotion is ignored (no instruction channel).
+- `QWEN3_MODE=design`: VoiceDesign synthetic. Config env: `QWEN3_MODEL`
+  (the VoiceDesign checkpoint dir), `QWEN3_DEVICE`, `QWEN3_DTYPE`.
+  No refs. Each voice is described in English (PROMPT_A male Madrid /
+  PROMPT_C female Madrid); per-block emotion is mapped from a Spanish tag
+  to a short English phrase and appended to the description.
+  `QWEN3_DO_SAMPLE=0` (default, deterministic) or `1`.
+
+Attention is SDPA on GPU / eager on CPU — the 12 Hz tokenizer does NOT
+import flash-attn (only the 25 Hz one does), so there is no flash-attn
+build step. Both modes use the same `qwen3-tts:local` container image and
+the same JSON protocol (`{spk, text, emotion, out}` on stdin; `ok`/`error`
+on stdout).
 
 ## Synthesis
 
@@ -254,10 +293,10 @@ not help (it's the model weights). Two working routes:
    ```bash
    python3 <skill-dir>/scripts/make_podcast.py \
        --script <path-to-script.txt> --out <path-to-output.mp3>
-   # default: --engine cosy
-   # --engine piper            : old Piper-only path (no emotion, seconds, fallback)
-   # --engine qwen             : Qwen3-TTS 1.7B-Base voice-clone (CPU, no emotion;
-   #                             see the Qwen3-TTS section — the GPU path is faster)
+   # --engine qwen     : DEFAULT — Qwen3-TTS 1.7B-Base voice-clone (CPU, no emotion)
+   # --engine qwen-syn : Qwen3-TTS 1.7B-VoiceDesign synthetic (CPU, emotion via description)
+   # --engine cosy     : CosyVoice3 0.5B voice-clone + emotion instruct
+   # --engine piper    : old Piper-only path (no emotion, seconds, fallback)
    # --voice-a/--voice-c       : Piper .onnx paths (cosy: clip source; piper: voices)
    # --ref-dir/--cosy-home     : override clip dir / CosyVoice install
    # --only START END --assemble --clean : chunked synthesis helpers
@@ -268,33 +307,50 @@ not help (it's the model weights). Two working routes:
 
 Success output: `OK podcast <out> (<bytes> bytes, <N> blocks, <nA> A / <nC> C, <nEmo> emotion, <engine>, <secs>s)`.
 
-Pipeline (cosy): each block → `cosyvoice_worker.py` (stdin JSON protocol) →
-`inference_instruct2` for EVERY block (emotion or the neutral default
-phrase; zero-shot is no longer used — it collapses on the 8 s female
-reference), with named params (`tts_text=, instruct_text=, prompt_wav=,
-stream=False, text_frontend=False`) → wav → concatenate with 380 ms silence →
-`libmp3lame` MP3 (VBR q3, 24 kHz mono). Piper pipeline: piper per block →
-resample 22050 Hz → same concat/MP3.
+Pipeline (default `qwen`): each block → `qwen3_worker.py` (stdin JSON
+protocol, `QWEN3_MODE=clone`) → voice-clone (ICL) with no emotion → wav →
+concatenate with 380 ms silence → `libmp3lame` MP3 (VBR q3, 24 kHz mono).
+`qwen-syn`: same worker, `QWEN3_MODE=design` → `generate_voice_design`
+(description + optional emotion) → wav → same concat/MP3. CosyVoice pipeline
+(`--engine cosy`): each block → `cosyvoice_worker.py` → `inference_instruct2`
+for EVERY block (emotion or the neutral default phrase; zero-shot is no longer
+used — it collapses on the 8 s female reference) with named params
+(`tts_text=, instruct_text=, prompt_wav=, stream=False,
+text_frontend=False`) → wav → same concat/MP3. Piper pipeline: piper per
+block → resample 22050 Hz → same concat/MP3.
 
 ### Requirements (one-time)
 
-- CosyVoice3 (default): code + model + venv under `~/.hermes/cache/cosyvoice/`
-  (`~/.hermes/venvs/cosyvoice/` with torch CPU, `code/` incl.
-  `third_party/Matcha-TTS`, `model_v3/` = Fun-CosyVoice3-0.5B-2512, 19 files),
-  reference clips in `~/.hermes/cache/cosyvoice/`. `ffmpeg` on PATH.
-  NOTE: the repo moved from `FunAudioLLM/CosyVoice` to `QwenAudio/CosyVoice`.
+- Qwen3-TTS (default, `--engine qwen`): `Qwen3-TTS-12Hz-1.7B-Base` model dir
+  at `~/.hermes/cache/qwen3-tts/model/` (self-contained, 4.5 GB) + ref clips
+  `refA.wav`/`refC.wav` (+ `refA.txt`/`refC.txt` transcripts) in
+  `~/.hermes/cache/qwen3-tts/`; GPU via the `qwen3-tts:local` podman image,
+  CPU via the `~/.hermes/venvs/qwen3tts/` venv. `ffmpeg` on PATH.
+- CosyVoice3 (`--engine cosy`, emotion variant): code + model + venv under
+  `~/.hermes/cache/cosyvoice/` (`~/.hermes/venvs/cosyvoice/` with torch CPU,
+  `code/` incl. `third_party/Matcha-TTS`, `model_v3/` =
+  Fun-CosyVoice3-0.5B-2512, 19 files), reference clips in
+  `~/.hermes/cache/cosyvoice/`. NOTE: the repo moved from
+  `FunAudioLLM/CosyVoice` to `QwenAudio/CosyVoice`.
 - Piper (fallback `--engine piper`): `piper` in the Hermes venv, voice models
   in `~/.hermes/cache/piper-voices/` (A `es_ES-davefx-medium.onnx`, C
   `es_MX-claude-high.onnx`, 22050 Hz).
-- Qwen3-TTS (`--engine qwen` / GPU swap): `Qwen3-TTS-12Hz-1.7B-Base` model dir
-  at `~/.hermes/cache/qwen3-tts/model/` (self-contained, 4.5 GB) + ref clips
-  `refA.wav`/`refC.wav` (+ `refA.txt`/`refC.txt` transcripts) in
+- Qwen3-TTS clone (`--engine qwen` / GPU swap): `Qwen3-TTS-12Hz-1.7B-Base`
+  model dir at `~/.hermes/cache/qwen3-tts/model/` (self-contained, 7.2 GB)
+  + ref clips `refA.wav`/`refC.wav` (+ `refA.txt`/`refC.txt` transcripts) in
   `~/.hermes/cache/qwen3-tts/`. GPU: the `qwen3-tts:local` podman image
   (CUDA 12.4.1 + torch 2.4.1+cu121 + qwen-tts, built from
-  `~/.hermes/cache/qwen3-tts/docker-build/`; CPU worker venv
+  `~/.hermes/cache/qwen3-tts/docker-build/`); CPU worker venv
   `~/.hermes/venvs/qwen3tts/` (Python 3.12, torch CPU, qwen-tts) for
-  `--engine qwen` on the host). `ffmpeg` on PATH. The 12 Hz tokenizer does
+  `--engine qwen` on the host. `ffmpeg` on PATH. The 12 Hz tokenizer does
   not need flash-attn (SDPA on GPU / eager on CPU).
+- Qwen3-TTS VoiceDesign (`--engine qwen-syn`): `Qwen3-TTS-12Hz-1.7B-
+  VoiceDesign` model dir at `~/.hermes/cache/qwen3-tts-voicedesign/model/`
+  (self-contained, 4.3 GB, its own speech_tokenizer — a SEPARATE checkpoint
+  from the Base clone model; do NOT point `QWEN3_MODEL` at the wrong one).
+  No ref clips. Same `qwen3-tts:local` image (the image's `qwen_tts` module
+  exposes both `generate_voice_clone` and `generate_voice_design`). The
+  `qwen3-podcast-gpu-target.sh` mounts this dir when `--mode design`.
 
 ## Verification (do this)
 
@@ -361,6 +417,19 @@ ffprobe -v error -show_entries format=duration,bit_rate -of default=nw=1 <out.mp
   qwen-tts` pulls the FULL package (both tokenizers), so onnxruntime/sox/
   einops are hard deps; torch/torchaudio/numpy must be pinned (constraints)
   so the resolver does not downgrade the CUDA build.
+- **Clone vs VoiceDesign are SEPARATE checkpoints (2026-10-25):** the Base
+  clone model (7.2 GB) and the VoiceDesign synthetic model (4.3 GB) are
+  different weights at different dirs — they do NOT share a single
+  `QWEN3_MODEL` mount. The GPU target selects which dir to mount from
+  `--mode`; the worker selects which API to call from `QWEN3_MODE`. Getting
+  these mixed (e.g. mounting the Base model for a design run) fails at the
+  first `generate_voice_design` call.
+- **CosyVoice venv `bin/python` symlinks can be stripped (migrated from iaahoy, 2026-10-25):**
+  if a CosyVoice CPU run fails in ~30 ms with a bare interpreter error,
+  check `~/.hermes/venvs/cosyvoice/bin/` — if the `python`/`python3`/
+  `python3.11` symlinks are gone, restore them to the base interpreter named
+  in `pyvenv.cfg` (`executable =`), e.g. `ln -sf <base> bin/python3.11 &&
+  ln -sf python3.11 bin/python3 && ln -sf python3.11 bin/python`.
 - **CPU dtype is fp32, not bf16 (2026-10-21):** bf16 on this i7-12700H was
   4x SLOWER per block (122 s vs 300 s+). CPU fp32 peaks at ~11 GiB RSS, so
   run `--engine qwen` in a `MemoryMax=12G` systemd unit — an 8 GiB unit OOMs

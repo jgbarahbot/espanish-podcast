@@ -92,6 +92,10 @@ QW_MODEL = os.environ.get("QWEN3_MODEL",
                                        "model"))
 QW_REFS = os.environ.get("QWEN3_REFS",
                          os.path.join(HOME, ".hermes", "cache", "qwen3-tts"))
+# qwen-syn (VoiceDesign) uses a separate checkpoint (no ref clips).
+QW_SYN_MODEL = os.environ.get("QWEN3_SYN_MODEL",
+                              os.path.join(HOME, ".hermes", "cache",
+                                           "qwen3-tts-voicedesign", "model"))
 QW_DEVICE = os.environ.get("QWEN3_DEVICE", "cpu")
 QW_DTYPE = os.environ.get("QWEN3_DTYPE", "fp32")
 QW_SR = 24000
@@ -444,6 +448,60 @@ class QwenWorker:
             self.proc.kill()
 
 
+class QwenSynWorker(QwenWorker):
+    """Qwen3-TTS VoiceDesign worker (100% synthetic, emotion via description).
+
+    Same JSON protocol and 24 kHz output as QwenWorker, but it loads the
+    VoiceDesign checkpoint and synthesizes with ``generate_voice_design``
+    (voice-by-description, no cloning): the two narrators are described in
+    English (Madrid, male A / female C) and a per-block Spanish emotion tag
+    is appended to the description in English. No ref clips are needed —
+    ``QWEN3_MODE=design`` tells the worker to skip them, so we pass the
+    model dir only.
+    """
+
+    def __init__(self, worker_py, worker, model_dir,
+                 device="cpu", dtype="fp32", timeout=600):
+        env = dict(os.environ, OMP_NUM_THREADS="4",
+                   QWEN3_MODEL=model_dir, QWEN3_MODE="design",
+                   QWEN3_DEVICE=device, QWEN3_DTYPE=dtype,
+                   QWEN3_DO_SAMPLE="0")
+        self.proc = subprocess.Popen([worker_py, worker],
+                                     stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL,
+                                     env=env, text=True, bufsize=1)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line = self.proc.stdout.readline()
+            if not line:
+                break
+            msg = json.loads(line)
+            if msg.get("ready"):
+                self.sr = msg.get("sr", QW_SR)
+                return
+            if "warmup_error" in msg:
+                print("WARNING: QwenSyn warmup: %s" % msg["warmup_error"])
+        raise SystemExit("ERROR: QwenSyn worker did not become ready (load timeout)")
+
+    def synth(self, out, spk, text, emotion=None):
+        # design mode DOES carry the emotion tag (unlike QwenWorker/Base,
+        # whose clone path ignores it): the worker appends it to the
+        # voice description in English.
+        job = {"spk": spk, "text": text, "emotion": emotion, "out": out}
+        self.proc.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise SystemExit("ERROR: QwenSyn worker died (pid=%s)" % self.proc.pid)
+            msg = json.loads(line)
+            if msg.get("ok"):
+                return msg["ok"]
+            if "error" in msg:
+                raise SystemExit("ERROR: QwenSyn synthesis failed: %s" % msg["error"])
+
+
 def assemble(wavs, gap_s, sr, out_mp3):
     tmp = os.path.abspath(out_mp3 + ".build")
     os.makedirs(tmp, exist_ok=True)
@@ -476,10 +534,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--script", required=True, help="path to two-voice Spanish script")
     ap.add_argument("--out", required=True, help="output MP3 path")
-    ap.add_argument("--engine", choices=("cosy", "piper", "qwen"), default="cosy",
-                    help="TTS engine: cosy=cosyvoice (emotion, CPU, slower), "
-                         "piper=local piper (fast, no emotion), "
-                         "qwen=qwen3-tts 1.7B voice-clone (CPU fp32, no emotion)")
+    ap.add_argument("--engine",
+                    choices=("qwen", "qwen-syn", "cosy", "piper"),
+                    default="qwen",
+                    help="TTS method: qwen=Qwen3-TTS voice-clone (DEFAULT, "
+                         "clones refA/refC, no emotion); qwen-syn=Qwen3-TTS "
+                         "synthetic (described voices, emotion); "
+                         "cosy=cosyvoice3 (clones, emotion instruct); "
+                         "piper=local piper (fast, no emotion)")
     ap.add_argument("--voice-a", default=VOICE_A, help="davefx voice model (piper/seed)")
     ap.add_argument("--voice-c", default=VOICE_C, help="Claude voice model (piper/seed)")
     ap.add_argument("--only", nargs=2, type=int, metavar=("START", "END"),
@@ -508,7 +570,7 @@ def main():
         print("ERROR: --only %d %d out of range (1..%d)" % (args.only[0], args.only[1], n))
         sys.exit(1)
 
-    sr = CV_SR if args.engine in ("cosy", "qwen") else 22050
+    sr = CV_SR if args.engine in ("cosy", "qwen", "qwen-syn") else 22050
     tmp = os.path.abspath(args.out + ".build")
     if args.clean:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -601,6 +663,51 @@ def main():
                 wavs.append(worker.synth(out, voice,
                                          spanish_digits(mark_english(text, pron_dict))))
                 print("block %02d %s %6.1fs" % (i, voice, time.time() - t))
+        finally:
+            worker.close()
+        if do_assemble:
+            assemble(wavs, GAP_S, sr, args.out)
+            shutil.rmtree(tmp, ignore_errors=True)
+            size = os.path.getsize(args.out)
+            print("OK podcast %s (%d bytes, %d blocks, %d A / %d C, %d emotion, %s, %.0fs)"
+                  % (args.out, size, n, counts["A"], counts["C"],
+                     n_emo, args.engine, time.time() - t0))
+        else:
+            print("chunk done: blocks %d-%d synthesized into %s (%.0fs)"
+                  % (args.only[0], args.only[1], tmp, time.time() - t0))
+            print("NEXT: run --only <next range> for the remaining blocks, then "
+                  "--assemble once blocks 1-%d all exist" % n)
+    elif args.engine == "qwen-syn":
+        # Qwen3-TTS VoiceDesign: 100% synthetic (no cloning), voices described
+        # in English (Madrid, male A / female C); per-block emotion is
+        # expressed by appending a short English phrase to the description.
+        if not os.path.exists(QW_SYN_MODEL):
+            print("ERROR: qwen3-tts VoiceDesign model missing: %s" % QW_SYN_MODEL)
+            sys.exit(1)
+        print("NOTE: qwen-syn is synthetic (no ref clips); %d emotion tag(s) "
+              "applied via description" % n_emo)
+        worker = QwenSynWorker(QW_PY, QW_WORKER, QW_SYN_MODEL,
+                               device=QW_DEVICE, dtype=QW_DTYPE)
+        sr = worker.sr
+        print("qwen-syn ready (sr=%d, device=%s, dtype=%s)"
+              % (sr, QW_DEVICE, QW_DTYPE))
+        wavs = []
+        try:
+            for i, (voice, emotion, text) in enumerate(blocks, 1):
+                if args.only and not (args.only[0] <= i <= args.only[1]):
+                    continue
+                out = os.path.join(tmp, "blk_%02d.wav" % i)
+                if os.path.exists(out) and os.path.getsize(out) > 1000:
+                    print("  block %02d already done, skipping" % i)
+                    wavs.append(out)
+                    continue
+                t = time.time()
+                wavs.append(worker.synth(out, voice,
+                                         spanish_digits(mark_english(text, pron_dict)),
+                                         emotion))
+                print("block %02d %s%s %6.1fs" %
+                      (i, voice, " [%s]" % emotion if emotion else "",
+                       time.time() - t))
         finally:
             worker.close()
         if do_assemble:
