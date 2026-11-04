@@ -1,6 +1,6 @@
 ---
 name: espanish-podcast
-version: 2.9.0
+version: 2.10.0
 description: "Use when synthesizing a Spanish podcast MP3 from a script."
 author: Jesus Gonzalez-Barahona
 license: MIT
@@ -131,9 +131,17 @@ A [solemne]: Esto ha sido IA Abierta Hoy.
 - **Verify every generated MP3 (v2.4.0):** transcribe the first and last
   blocks and check no English instruction text is audible. Tool: faster-whisper
   (model `Systran/faster-whisper-medium`, already downloaded in
-  `~/.cache/huggingface`) with the Python 3.14 venv at
-  `/home/jgb/.hermes/installs/d6a27a1debcdb2b5/environments/87801bca3da147548792a18b93c00f82/venv/bin/python`
-  (script template: `/tmp/transcribe_block.py` or `whisper`-style ad-hoc).
+  `~/.cache/huggingface`; set `HF_HUB_OFFLINE=1`) with `device="cpu"` /
+  `compute_type="int8"`. Working venv as of 2026-11-03:
+  `/home/jgb/tools/openvino-whisper-venv/bin/python` (faster-whisper +
+  ctranslate2 4.6.0 — its ctranslate2 LACKS the OpenVINO plugin, so
+  `device` must be `cpu`, not `openvino`). The older pm-env venv under
+  `/home/jgb/.hermes/installs/` was gone by then; if this one disappears,
+  locate any faster_whisper interpreter with
+  `find /home/jgb -maxdepth 8 -name faster_whisper`. Validated 2026-11-03:
+  2×17 s clips, medium int8, both blocks transcribed as clean Spanish with
+  no instruction-phrase leakage (~5 min total) — this is the path to use
+  for the leak check.
 - **Raw English instructions in the script (v2.3.0):** instead of (or in
   addition to) the Spanish keys, a tag may be the instruction itself —
   `A [Speak cheerfully and loud]: ...`. The worker's `resolve_instruct()`
@@ -248,8 +256,12 @@ this path, though `spanish_digits()` (numbers in Spanish) still applies.
    4x SLOWER on this i7, use it only on the GPU path). Same JSON worker
    protocol. ~1-2 min/block, so a full podcast takes a long time — use it
    for short tests or single-block A/Bs, not whole episodes (the GPU path
-   is the real one). Peak RSS is ~11 GiB for clone / ~8 GiB for design:
-   run it in a `MemoryMax=12G` systemd unit (fp32 OOMs an 8 GiB unit),
+   is the real one). Peak RSS is ~11 GiB for clone / ~8 GiB for design on
+   SHORT test blocks, but memory keeps growing across a full episode: a
+   18-block clone episode peaked at 21.6 GiB (2026-11-03, i7-12700H) and
+   OOM-killed a 12G unit at block 3/18. Run short tests in a
+   `MemoryMax=12G` systemd unit (fp32 OOMs an 8 GiB unit) and FULL
+   episodes in a `MemoryMax=32G` unit,
    never inside a 4 GiB Hermes worker scope. **Validated 2026-10-25** in a
    `systemd-run --user --property=MemoryMax=12G` unit running the worker
    directly: both modes loaded and synthesized cleanly (design ~1.8G at
@@ -439,8 +451,11 @@ ffprobe -v error -show_entries format=duration,bit_rate -of default=nw=1 <out.mp
   in `pyvenv.cfg` (`executable =`), e.g. `ln -sf <base> bin/python3.11 &&
   ln -sf python3.11 bin/python3 && ln -sf python3.11 bin/python`.
 - **CPU dtype is fp32, not bf16 (2026-10-21):** bf16 on this i7-12700H was
-  4x SLOWER per block (122 s vs 300 s+). CPU fp32 peaks at ~11 GiB RSS, so
-  run `--engine qwen` in a `MemoryMax=12G` systemd unit — an 8 GiB unit OOMs
+  4x SLOWER per block (122 s vs 300 s+). CPU fp32 peaks at ~11 GiB RSS on
+  short tests, but grows across a full episode: the 2026-11-03 18-block
+  clone episode hit 21.6 GiB and OOM-killed a 12G unit at block 3/18 (a
+  20G unit completed it, peak 21.6G). Run full CPU episodes in a
+  `MemoryMax=32G` systemd unit; 12G is only for short tests; 8 GiB OOMs
   during load.
 - **The qwen_tts import prints a "flash-attn is not installed" banner to
   STDOUT (2026-10-21)** — it corrupts the worker's stdout JSON protocol on
